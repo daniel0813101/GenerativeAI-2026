@@ -30,6 +30,8 @@ def run_inference(
         batch_size: Evaluation batch size.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     if tokenizer.pad_token is None:
@@ -62,7 +64,8 @@ def run_inference(
         for batch in dataloader:
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
             last_indices = attention_mask.sum(dim=1) - 1
             batch_indices = torch.arange(input_ids.size(0), device=device)
