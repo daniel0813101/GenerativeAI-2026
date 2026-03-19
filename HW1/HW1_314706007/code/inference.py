@@ -15,10 +15,20 @@ from utils import ID_TO_LABEL, get_choice_token_ids, load_dataset
 def run_inference(
     model_dir: str | Path,
     benchmark_csv: str | Path,
-    output_csv: str | Path,
+    output_csv: str | Path | None,
     max_length: int = 512,
     batch_size: int = 4,
 ) -> None:
+    """Run benchmark inference and export predictions to CSV.
+
+    Args:
+        model_dir: Directory containing a saved model checkpoint.
+        benchmark_csv: Path to the unlabeled benchmark CSV.
+        output_csv: Destination path for prediction output. If ``None``, the file
+            is saved inside ``model_dir`` as ``submission.csv``.
+        max_length: Maximum prompt length.
+        batch_size: Evaluation batch size.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
@@ -64,7 +74,7 @@ def run_inference(
             question_ids.extend(batch["question_id"].tolist())
 
     submission = pd.DataFrame({"question_id": question_ids, "ans": predictions})
-    output_csv = Path(output_csv)
+    output_csv = Path(output_csv) if output_csv is not None else Path(model_dir) / "submission.csv"
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     submission.to_csv(output_csv, index=False)
     print(f"Saved submission to {output_csv}")
@@ -72,10 +82,15 @@ def run_inference(
 
 
 def parse_args():
+    """Parse CLI arguments for benchmark inference.
+
+    Returns:
+        Parsed command-line arguments.
+    """
     parser = argparse.ArgumentParser(description="Run benchmark inference for the PathoQA baseline.")
-    parser.add_argument("--model_dir", type=str, default="../saved_models/checkpoint/baseline")
+    parser.add_argument("--model_dir", type=str, required=True)
     parser.add_argument("--benchmark_csv", type=str, default="../dataset/benchmark.csv")
-    parser.add_argument("--output_csv", type=str, default="../saved_models/checkpoint/baseline/submission.csv")
+    parser.add_argument("--output_csv", type=str, default=None)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
     return parser.parse_args()

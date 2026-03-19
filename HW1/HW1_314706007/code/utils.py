@@ -19,6 +19,11 @@ OPTION_COLUMNS = ["opa", "opb", "opc", "opd"]
 
 
 def set_seed(seed: int) -> None:
+    """Set random seeds for reproducible experiments.
+
+    Args:
+        seed: Random seed applied to Python and PyTorch.
+    """
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -26,6 +31,14 @@ def set_seed(seed: int) -> None:
 
 
 def load_dataset(csv_path: str | Path) -> pd.DataFrame:
+    """Load a CSV file into a DataFrame.
+
+    Args:
+        csv_path: Path to the dataset CSV file.
+
+    Returns:
+        A pandas DataFrame. If an ``ans`` column exists, it is cast to ``int``.
+    """
     df = pd.read_csv(csv_path)
     if "ans" in df.columns:
         df["ans"] = df["ans"].astype(int)
@@ -35,39 +48,65 @@ def load_dataset(csv_path: str | Path) -> pd.DataFrame:
 def split_dataframe(
     df: pd.DataFrame,
     val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
     random_state: int = 42,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    train_df, val_df = train_test_split(
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split a labeled dataset into train, validation, and test DataFrames.
+
+    Args:
+        df: Full labeled dataset.
+        val_ratio: Fraction of samples assigned to the validation split.
+        test_ratio: Fraction of samples assigned to the test split.
+        random_state: Random seed used by ``train_test_split``.
+
+    Returns:
+        A tuple of ``(train_df, val_df, test_df)`` with reset indices.
+
+    Raises:
+        ValueError: If the split ratios are invalid.
+    """
+    if val_ratio <= 0 or test_ratio <= 0:
+        raise ValueError("val_ratio and test_ratio must both be greater than 0.")
+    if val_ratio + test_ratio >= 1:
+        raise ValueError("val_ratio + test_ratio must be less than 1.")
+
+    stratify_labels = df["ans"] if "ans" in df.columns else None
+
+    train_df, temp_df = train_test_split(
         df,
-        test_size=val_ratio,
+        test_size=val_ratio + test_ratio,
         random_state=random_state,
         shuffle=True,
-        stratify=df["ans"] if "ans" in df.columns else None,
+        stratify=stratify_labels,
     )
-    return train_df.reset_index(drop=True), val_df.reset_index(drop=True)
 
+    temp_stratify = temp_df["ans"] if "ans" in temp_df.columns else None
+    relative_test_ratio = test_ratio / (val_ratio + test_ratio)
 
-def maybe_create_splits(
-    dataset_csv: str | Path,
-    train_csv: str | Path,
-    val_csv: str | Path,
-    val_ratio: float = 0.1,
-    random_state: int = 42,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    train_csv = Path(train_csv)
-    val_csv = Path(val_csv)
+    val_df, test_df = train_test_split(
+        temp_df,
+        test_size=relative_test_ratio,
+        random_state=random_state,
+        shuffle=True,
+        stratify=temp_stratify,
+    )
 
-    if train_csv.exists() and val_csv.exists():
-        return load_dataset(train_csv), load_dataset(val_csv)
-
-    df = load_dataset(dataset_csv)
-    train_df, val_df = split_dataframe(df, val_ratio=val_ratio, random_state=random_state)
-    train_df.to_csv(train_csv, index=False)
-    val_df.to_csv(val_csv, index=False)
-    return train_df, val_df
+    return (
+        train_df.reset_index(drop=True),
+        val_df.reset_index(drop=True),
+        test_df.reset_index(drop=True),
+    )
 
 
 def build_prompt(row: pd.Series | Dict[str, object]) -> str:
+    """Format one MCQ row into the baseline instruction prompt.
+
+    Args:
+        row: A dataset row containing the question and options.
+
+    Returns:
+        The prompt string given to the language model.
+    """
     return (
         "You are a medical pathology question answering assistant.\n"
         "Read the multiple-choice question and return only the correct option letter.\n\n"
@@ -82,14 +121,41 @@ def build_prompt(row: pd.Series | Dict[str, object]) -> str:
 
 
 def label_id_to_text(label_id: int) -> str:
+    """Convert an integer class id into an option letter.
+
+    Args:
+        label_id: Integer label in ``{0, 1, 2, 3}``.
+
+    Returns:
+        The corresponding option letter in ``{"A", "B", "C", "D"}``.
+    """
     return ID_TO_LABEL[int(label_id)]
 
 
 def label_text_to_id(label_text: str) -> int:
+    """Convert an option letter into an integer class id.
+
+    Args:
+        label_text: Answer letter such as ``"A"`` or ``"c"``.
+
+    Returns:
+        The corresponding integer label.
+    """
     return LABEL_TO_ID[label_text.strip().upper()]
 
 
 def extract_prediction(text: str) -> int:
+    """Parse the first valid answer choice from model text output.
+
+    Args:
+        text: Raw generated text from the model.
+
+    Returns:
+        The predicted class id.
+
+    Raises:
+        ValueError: If no valid answer choice can be parsed.
+    """
     normalized = text.strip().upper()
     for choice in ("A", "B", "C", "D"):
         if normalized.startswith(choice):
@@ -98,6 +164,17 @@ def extract_prediction(text: str) -> int:
 
 
 def get_choice_token_ids(tokenizer) -> Dict[str, int]:
+    """Map answer letters to their tokenizer token ids.
+
+    Args:
+        tokenizer: Hugging Face tokenizer used by the baseline model.
+
+    Returns:
+        A mapping from answer letters to token ids.
+
+    Raises:
+        ValueError: If a choice letter does not map to a single token.
+    """
     token_ids: Dict[str, int] = {}
     for choice in ("A", "B", "C", "D"):
         encoded = tokenizer.encode(f" {choice}", add_special_tokens=False)
@@ -111,6 +188,15 @@ def get_choice_token_ids(tokenizer) -> Dict[str, int]:
 
 
 def compute_accuracy(predictions: Sequence[int], references: Sequence[int]) -> float:
+    """Compute classification accuracy.
+
+    Args:
+        predictions: Predicted class ids.
+        references: Ground-truth class ids.
+
+    Returns:
+        The fraction of correct predictions.
+    """
     if not references:
         return 0.0
     correct = sum(int(pred == ref) for pred, ref in zip(predictions, references))
@@ -118,6 +204,12 @@ def compute_accuracy(predictions: Sequence[int], references: Sequence[int]) -> f
 
 
 def save_json(data: Dict[str, object], save_path: str | Path) -> None:
+    """Save a dictionary as a JSON file.
+
+    Args:
+        data: Serializable dictionary content.
+        save_path: Destination JSON path.
+    """
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     with open(save_path, "w", encoding="utf-8") as fp:
@@ -125,11 +217,25 @@ def save_json(data: Dict[str, object], save_path: str | Path) -> None:
 
 
 def load_json(json_path: str | Path) -> Dict[str, object]:
+    """Load a JSON file into a dictionary.
+
+    Args:
+        json_path: Path to the JSON file.
+
+    Returns:
+        Parsed JSON content.
+    """
     with open(json_path, "r", encoding="utf-8") as fp:
         return json.load(fp)
 
 
 def plot_training_history(history: List[Dict[str, float]], save_path: str | Path) -> None:
+    """Plot training and validation metrics across epochs.
+
+    Args:
+        history: Per-epoch metric dictionaries.
+        save_path: Output image path.
+    """
     if not history:
         return
 
@@ -162,6 +268,49 @@ def plot_training_history(history: List[Dict[str, float]], save_path: str | Path
     plt.close(fig)
 
 
+def plot_test_results(
+    predictions: Sequence[int],
+    references: Sequence[int],
+    save_path: str | Path,
+) -> None:
+    """Plot held-out test correctness and label distributions.
+
+    Args:
+        predictions: Predicted class ids on the test split.
+        references: Ground-truth class ids on the test split.
+        save_path: Output image path.
+    """
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    total = len(references)
+    correct = sum(int(pred == ref) for pred, ref in zip(predictions, references))
+    incorrect = total - correct
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    axes[0].bar(["correct", "incorrect"], [correct, incorrect], color=["tab:green", "tab:red"])
+    axes[0].set_title("Test Prediction Outcome")
+    axes[0].set_ylabel("Count")
+
+    labels = ["A", "B", "C", "D"]
+    pred_counts = [sum(int(pred == idx) for pred in predictions) for idx in range(4)]
+    ref_counts = [sum(int(ref == idx) for ref in references) for idx in range(4)]
+    x = range(len(labels))
+    width = 0.35
+    axes[1].bar([i - width / 2 for i in x], ref_counts, width=width, label="ground_truth")
+    axes[1].bar([i + width / 2 for i in x], pred_counts, width=width, label="prediction")
+    axes[1].set_xticks(list(x))
+    axes[1].set_xticklabels(labels)
+    axes[1].set_title("Test Label Distribution")
+    axes[1].set_ylabel("Count")
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 @dataclass
 class MCQBatch:
     input_ids: torch.Tensor
@@ -171,9 +320,23 @@ class MCQBatch:
 
 class SupervisedCollator:
     def __init__(self, tokenizer):
+        """Initialize the collator with tokenizer padding metadata.
+
+        Args:
+            tokenizer: Tokenizer providing the pad token id.
+        """
         self.pad_token_id = tokenizer.pad_token_id
 
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> MCQBatch:
+        """Pad a batch of supervised training features.
+
+        Args:
+            features: Tokenized examples with ``input_ids``, ``attention_mask``,
+                and ``labels``.
+
+        Returns:
+            A padded ``MCQBatch`` ready for model input.
+        """
         input_ids = pad_sequence(
             [feature["input_ids"] for feature in features],
             batch_first=True,
