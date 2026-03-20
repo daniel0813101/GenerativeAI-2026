@@ -42,8 +42,10 @@ class TrainingConfig:
     eval_batch_size: int = 4
     learning_rate: float = 2e-5
     num_epochs: int = 50
-    weight_decay: float = 0.01
+    weight_decay: float = 0.03
     warmup_ratio: float = 0.1
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 0.01
     max_length: int = 512
     grad_accum_steps: int = 4
     val_ratio: float = 0.1
@@ -51,9 +53,9 @@ class TrainingConfig:
     seed: int = 42
     num_workers: int = 4
     use_lora: bool = True
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
+    lora_r: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.15
     lora_target_modules: str = "q_proj,v_proj"
 
 
@@ -513,6 +515,7 @@ def train(config: TrainingConfig) -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
     history: List[Dict[str, float]] = []
     best_accuracy = -1.0
+    epochs_without_improvement = 0
 
     for epoch in range(1, config.num_epochs + 1):
         model.train()
@@ -570,9 +573,18 @@ def train(config: TrainingConfig) -> None:
             f"val_accuracy={val_accuracy:.4f}"
         )
 
-        if val_accuracy > best_accuracy:
+        if val_accuracy > best_accuracy + config.early_stopping_min_delta:
             best_accuracy = val_accuracy
+            epochs_without_improvement = 0
             save_checkpoint(model, tokenizer, run_dir, config, history)
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= config.early_stopping_patience:
+                print(
+                    "Early stopping triggered: "
+                    f"no validation accuracy improvement for {config.early_stopping_patience} epoch(s)."
+                )
+                break
 
     plot_training_history(history, run_dir / "training_curve.png")
 
@@ -628,6 +640,8 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
+    parser.add_argument("--early_stopping_patience", type=int, default=5)
+    parser.add_argument("--early_stopping_min_delta", type=float, default=0.01)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--grad_accum_steps", type=int, default=8)
     parser.add_argument("--val_ratio", type=float, default=0.1)
