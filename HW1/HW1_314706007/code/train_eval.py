@@ -8,6 +8,7 @@ from typing import Dict, List
 
 import pandas as pd
 import torch
+from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
@@ -37,18 +38,23 @@ class TrainingConfig:
     model_name: str = DEFAULT_MODEL_NAME
     dataset_csv: str = "../dataset/dataset.csv"
     output_dir: str = "../saved_models/checkpoint"
-    batch_size: int = 2
+    batch_size: int = 8
     eval_batch_size: int = 4
     learning_rate: float = 2e-5
-    num_epochs: int = 3
+    num_epochs: int = 50
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
     max_length: int = 512
-    grad_accum_steps: int = 8
+    grad_accum_steps: int = 4
     val_ratio: float = 0.1
     test_ratio: float = 0.1
     seed: int = 42
     num_workers: int = 4
+    use_lora: bool = True
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: str = "q_proj,v_proj"
 
 
 class SupervisedMCQDataset(Dataset):
@@ -344,9 +350,75 @@ def save_checkpoint(model, tokenizer, output_dir: str | Path, config: TrainingCo
     output_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-    torch.save(model.state_dict(), output_dir / "model.pt")
+    if not getattr(model, "is_peft_model", False):
+        torch.save(model.state_dict(), output_dir / "model.pt")
     save_json(asdict(config), output_dir / "train_config.json")
     save_json({"history": history}, output_dir / "history.json")
+
+
+def create_model(config: TrainingConfig, tokenizer, device: torch.device):
+    """Load a base language model and optionally attach LoRA adapters.
+
+    Args:
+        config: Training configuration containing the base model name and
+            optional LoRA hyperparameters.
+        tokenizer: Tokenizer used to provide the model pad token id.
+        device: Target device where the model should be placed.
+
+    Returns:
+        A causal language model on ``device``. If ``config.use_lora`` is
+        ``True``, the returned model is a PEFT-wrapped model with trainable
+        LoRA adapters attached to the requested target modules.
+    """
+    model = AutoModelForCausalLM.from_pretrained(config.model_name)
+    model.config.pad_token_id = tokenizer.pad_token_id
+
+    if config.use_lora:
+        target_modules = [module.strip() for module in config.lora_target_modules.split(",") if module.strip()]
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+
+    model.to(device)
+    return model
+
+
+def load_saved_model(model_dir: str | Path, tokenizer, device: torch.device):
+    """Load a checkpoint saved from either LoRA or full fine-tuning.
+
+    Args:
+        model_dir: Directory containing a saved checkpoint. This may be a LoRA
+            adapter directory with ``adapter_config.json`` or a full model
+            directory saved with ``save_pretrained``.
+        tokenizer: Tokenizer used to set the model pad token id after loading.
+        device: Target device where the loaded model should be placed.
+
+    Returns:
+        A causal language model restored from ``model_dir`` and moved to
+        ``device``. LoRA checkpoints are reconstructed by loading the base
+        model first and then attaching the saved adapters.
+    """
+    model_dir = Path(model_dir)
+    adapter_config_path = model_dir / "adapter_config.json"
+
+    if adapter_config_path.exists():
+        peft_config = PeftConfig.from_pretrained(model_dir)
+        model = AutoModelForCausalLM.from_pretrained(peft_config.base_model_name_or_path)
+        model = PeftModel.from_pretrained(model, model_dir)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_dir)
+
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.to(device)
+    return model
 
 
 def create_run_dir(output_root: str | Path) -> Path:
@@ -386,9 +458,7 @@ def train(config: TrainingConfig) -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(config.model_name)
-    model.config.pad_token_id = tokenizer.pad_token_id
-    model.to(device)
+    model = create_model(config, tokenizer, device)
     pin_memory = device.type == "cuda"
 
     train_dataset = SupervisedMCQDataset(train_df, tokenizer, config.max_length)
@@ -506,9 +576,7 @@ def train(config: TrainingConfig) -> None:
 
     plot_training_history(history, run_dir / "training_curve.png")
 
-    best_model = AutoModelForCausalLM.from_pretrained(run_dir)
-    best_model.config.pad_token_id = tokenizer.pad_token_id
-    best_model.to(device)
+    best_model = load_saved_model(run_dir, tokenizer, device)
 
     test_predictions_df = collect_predictions(best_model, test_prompt_loader, tokenizer, device)
     test_accuracy = compute_accuracy(
@@ -554,10 +622,10 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--model_name", type=str, default=DEFAULT_MODEL_NAME)
     parser.add_argument("--dataset_csv", type=str, default="../dataset/dataset.csv")
     parser.add_argument("--output_dir", type=str, default="../saved_models/checkpoint")
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--eval_batch_size", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=2e-5)
-    parser.add_argument("--num_epochs", type=int, default=3)
+    parser.add_argument("--num_epochs", type=int, default=50)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--max_length", type=int, default=512)
@@ -565,7 +633,12 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--test_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--use_lora", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_target_modules", type=str, default="q_proj,v_proj")
     args = parser.parse_args()
     return TrainingConfig(**vars(args))
 

@@ -6,9 +6,9 @@ from pathlib import Path
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
-from train_eval import PromptOnlyDataset, prompt_collate_fn
+from train_eval import PromptOnlyDataset, load_saved_model, prompt_collate_fn
 from utils import ID_TO_LABEL, get_choice_token_ids, load_dataset
 
 
@@ -37,9 +37,7 @@ def run_inference(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(model_dir)
-    model.config.pad_token_id = tokenizer.pad_token_id
-    model.to(device)
+    model = load_saved_model(model_dir, tokenizer, device)
     model.eval()
 
     benchmark_df = load_dataset(benchmark_csv)
