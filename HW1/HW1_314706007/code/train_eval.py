@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Dict, List
 
@@ -630,29 +630,23 @@ def parse_args() -> TrainingConfig:
     Returns:
         Parsed training configuration.
     """
+    default_config = TrainingConfig()
     parser = argparse.ArgumentParser(description="Baseline training / evaluation for PathoQA.")
-    parser.add_argument("--model_name", type=str, default=DEFAULT_MODEL_NAME)
-    parser.add_argument("--dataset_csv", type=str, default="../dataset/dataset.csv")
-    parser.add_argument("--output_dir", type=str, default="../saved_models/checkpoint")
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--eval_batch_size", type=int, default=4)
-    parser.add_argument("--learning_rate", type=float, default=2e-5)
-    parser.add_argument("--num_epochs", type=int, default=50)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--warmup_ratio", type=float, default=0.1)
-    parser.add_argument("--early_stopping_patience", type=int, default=5)
-    parser.add_argument("--early_stopping_min_delta", type=float, default=0.01)
-    parser.add_argument("--max_length", type=int, default=512)
-    parser.add_argument("--grad_accum_steps", type=int, default=8)
-    parser.add_argument("--val_ratio", type=float, default=0.1)
-    parser.add_argument("--test_ratio", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--use_lora", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--lora_r", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
-    parser.add_argument("--lora_dropout", type=float, default=0.05)
-    parser.add_argument("--lora_target_modules", type=str, default="q_proj,v_proj")
+    for config_field in fields(TrainingConfig):
+        default_value = getattr(default_config, config_field.name)
+        argument_name = f"--{config_field.name}"
+        if isinstance(default_value, bool):
+            parser.add_argument(
+                argument_name,
+                action=argparse.BooleanOptionalAction,
+                default=default_value,
+            )
+        else:
+            parser.add_argument(
+                argument_name,
+                type=type(default_value),
+                default=default_value,
+            )
     args = parser.parse_args()
     return TrainingConfig(**vars(args))
 
