@@ -8,6 +8,7 @@ from typing import Dict, List
 
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
@@ -40,12 +41,12 @@ class TrainingConfig:
     output_dir: str = "../saved_models/checkpoint"
     batch_size: int = 8
     eval_batch_size: int = 4
-    learning_rate: float = 2e-5
-    num_epochs: int = 50
-    weight_decay: float = 0.03
+    learning_rate: float = 1e-5
+    num_epochs: int = 20
+    weight_decay: float = 0.01
     warmup_ratio: float = 0.1
     early_stopping_patience: int = 5
-    early_stopping_min_delta: float = 0.01
+    early_stopping_min_delta: float = 0.0
     max_length: int = 512
     grad_accum_steps: int = 4
     val_ratio: float = 0.1
@@ -53,9 +54,9 @@ class TrainingConfig:
     seed: int = 42
     num_workers: int = 4
     use_lora: bool = True
-    lora_r: int = 8
-    lora_alpha: int = 16
-    lora_dropout: float = 0.15
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
     lora_target_modules: str = "q_proj,v_proj"
 
 
@@ -185,38 +186,50 @@ def prompt_collate_fn(features: List[Dict[str, torch.Tensor]], tokenizer) -> Dic
     return batch
 
 
-def evaluate_loss(model, dataloader: DataLoader, device: torch.device) -> float:
-    """Compute average loss over a supervised dataloader.
+def evaluate_choice_loss(
+    model,
+    dataloader: DataLoader,
+    tokenizer,
+    device: torch.device,
+) -> float:
+    """Compute choice-only validation loss over A/B/C/D logits.
 
     Args:
         model: Causal language model under evaluation.
-        dataloader: Dataloader that yields supervised batches.
+        dataloader: Dataloader yielding prompt-only labeled batches.
+        tokenizer: Tokenizer used to identify answer token ids.
         device: Device used for evaluation.
 
     Returns:
-        Mean batch loss across the dataloader.
+        Mean cross-entropy loss over the four answer choices.
     """
     model.eval()
     running_loss = 0.0
+    batch_count = 0
+    choice_token_ids = get_choice_token_ids(tokenizer)
+    candidate_ids = torch.tensor(
+        [choice_token_ids["A"], choice_token_ids["B"], choice_token_ids["C"], choice_token_ids["D"]],
+        device=device,
+    )
     use_amp = device.type == "cuda"
     amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
 
     with torch.no_grad():
         for batch in dataloader:
-            batch = MCQBatch(
-                input_ids=batch.input_ids.to(device, non_blocking=True),
-                attention_mask=batch.attention_mask.to(device, non_blocking=True),
-                labels=batch.labels.to(device, non_blocking=True),
-            )
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            targets = batch["target"].to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                outputs = model(
-                    input_ids=batch.input_ids,
-                    attention_mask=batch.attention_mask,
-                    labels=batch.labels,
-                )
-            running_loss += outputs.loss.item()
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
-    return running_loss / max(len(dataloader), 1)
+            last_indices = attention_mask.sum(dim=1) - 1
+            batch_indices = torch.arange(input_ids.size(0), device=device)
+            next_token_logits = outputs.logits[batch_indices, last_indices]
+            choice_logits = next_token_logits.index_select(dim=-1, index=candidate_ids)
+            running_loss += F.cross_entropy(choice_logits, targets).item()
+            batch_count += 1
+
+    return running_loss / max(batch_count, 1)
 
 
 def predict_choice_ids(
@@ -464,7 +477,6 @@ def train(config: TrainingConfig) -> None:
     pin_memory = device.type == "cuda"
 
     train_dataset = SupervisedMCQDataset(train_df, tokenizer, config.max_length)
-    val_dataset = SupervisedMCQDataset(val_df, tokenizer, config.max_length)
     val_prompt_dataset = PromptOnlyDataset(val_df, tokenizer, config.max_length)
     test_prompt_dataset = PromptOnlyDataset(test_df, tokenizer, config.max_length)
 
@@ -472,14 +484,6 @@ def train(config: TrainingConfig) -> None:
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=pin_memory,
-        collate_fn=SupervisedCollator(tokenizer),
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.eval_batch_size,
-        shuffle=False,
         num_workers=config.num_workers,
         pin_memory=pin_memory,
         collate_fn=SupervisedCollator(tokenizer),
@@ -556,7 +560,7 @@ def train(config: TrainingConfig) -> None:
             progress_bar.set_postfix(loss=f"{running_loss / step:.4f}")
 
         train_loss = running_loss / max(len(train_loader), 1)
-        val_loss = evaluate_loss(model, val_loader, device)
+        val_loss = evaluate_choice_loss(model, val_prompt_loader, tokenizer, device)
         val_accuracy = evaluate_accuracy(model, val_prompt_loader, tokenizer, device)
 
         epoch_log = {
