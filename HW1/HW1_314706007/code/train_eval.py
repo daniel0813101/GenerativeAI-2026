@@ -16,12 +16,9 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 
 from utils import (
-    MCQBatch,
-    SupervisedCollator,
     build_prompt,
     compute_accuracy,
     get_choice_token_ids,
-    label_id_to_text,
     load_dataset,
     plot_test_results,
     plot_training_history,
@@ -57,59 +54,7 @@ class TrainingConfig:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
-    lora_target_modules: str = "q_proj,v_proj"
-
-
-class SupervisedMCQDataset(Dataset):
-    def __init__(self, dataframe: pd.DataFrame, tokenizer, max_length: int) -> None:
-        """Build supervised examples for causal language model training.
-
-        Args:
-            dataframe: Labeled MCQ samples.
-            tokenizer: Tokenizer used to encode prompts and answers.
-            max_length: Maximum token length per sample.
-        """
-        self.dataframe = dataframe.reset_index(drop=True)
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.examples = [self._build_example(index) for index in range(len(self.dataframe))]
-
-    def __len__(self) -> int:
-        """Return the number of rows in the dataset."""
-        return len(self.examples)
-
-    def _build_example(self, index: int) -> Dict[str, torch.Tensor]:
-        """Tokenize and cache one supervised training example."""
-        row = self.dataframe.iloc[index]
-        prompt = build_prompt(row)
-        answer = f" {label_id_to_text(int(row['ans']))}{self.tokenizer.eos_token}"
-
-        prompt_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-        answer_ids = self.tokenizer(answer, add_special_tokens=False)["input_ids"]
-        prompt_ids = prompt_ids[: max(self.max_length - len(answer_ids), 1)]
-
-        input_ids = prompt_ids + answer_ids
-        prompt_length = len(prompt_ids)
-        labels = [-100] * prompt_length + input_ids[prompt_length:]
-
-        attention_mask = [1] * len(input_ids)
-
-        return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
-        }
-
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        """Create one supervised training example.
-
-        Args:
-            index: Dataset row index.
-
-        Returns:
-            A dictionary containing tokenized model inputs and labels.
-        """
-        return self.examples[index]
+    lora_target_modules: str = "q_proj,k_proj"
 
 
 class PromptOnlyDataset(Dataset):
@@ -186,6 +131,31 @@ def prompt_collate_fn(features: List[Dict[str, torch.Tensor]], tokenizer) -> Dic
     return batch
 
 
+def compute_choice_logits(
+    model,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    candidate_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Compute logits over answer choices for the next token position.
+
+    Args:
+        model: Causal language model being trained or evaluated.
+        input_ids: Prompt token ids with shape ``(batch_size, seq_len)``.
+        attention_mask: Attention mask with shape ``(batch_size, seq_len)``.
+        candidate_ids: Token ids for the answer choices ``A/B/C/D``.
+
+    Returns:
+        A tensor of shape ``(batch_size, 4)`` containing logits for the
+        answer choices only.
+    """
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    last_indices = attention_mask.sum(dim=1) - 1
+    batch_indices = torch.arange(input_ids.size(0), device=input_ids.device)
+    next_token_logits = outputs.logits[batch_indices, last_indices]
+    return next_token_logits.index_select(dim=-1, index=candidate_ids)
+
+
 def evaluate_choice_loss(
     model,
     dataloader: DataLoader,
@@ -220,12 +190,7 @@ def evaluate_choice_loss(
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             targets = batch["target"].to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-
-            last_indices = attention_mask.sum(dim=1) - 1
-            batch_indices = torch.arange(input_ids.size(0), device=device)
-            next_token_logits = outputs.logits[batch_indices, last_indices]
-            choice_logits = next_token_logits.index_select(dim=-1, index=candidate_ids)
+                choice_logits = compute_choice_logits(model, input_ids, attention_mask, candidate_ids)
             running_loss += F.cross_entropy(choice_logits, targets).item()
             batch_count += 1
 
@@ -261,12 +226,7 @@ def predict_choice_ids(
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-
-            last_indices = attention_mask.sum(dim=1) - 1
-            batch_indices = torch.arange(input_ids.size(0), device=device)
-            next_token_logits = outputs.logits[batch_indices, last_indices]
-            choice_logits = next_token_logits.index_select(dim=-1, index=candidate_ids)
+                choice_logits = compute_choice_logits(model, input_ids, attention_mask, candidate_ids)
             batch_predictions = choice_logits.argmax(dim=-1).detach().cpu().tolist()
             predictions.extend(batch_predictions)
 
@@ -326,12 +286,7 @@ def collect_predictions(
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-
-            last_indices = attention_mask.sum(dim=1) - 1
-            batch_indices = torch.arange(input_ids.size(0), device=device)
-            next_token_logits = outputs.logits[batch_indices, last_indices]
-            choice_logits = next_token_logits.index_select(dim=-1, index=candidate_ids)
+                choice_logits = compute_choice_logits(model, input_ids, attention_mask, candidate_ids)
             batch_predictions = choice_logits.argmax(dim=-1).detach().cpu().tolist()
 
             targets = batch["target"].tolist() if "target" in batch else [None] * len(batch_predictions)
@@ -476,17 +431,17 @@ def train(config: TrainingConfig) -> None:
     model = create_model(config, tokenizer, device)
     pin_memory = device.type == "cuda"
 
-    train_dataset = SupervisedMCQDataset(train_df, tokenizer, config.max_length)
+    train_prompt_dataset = PromptOnlyDataset(train_df, tokenizer, config.max_length)
     val_prompt_dataset = PromptOnlyDataset(val_df, tokenizer, config.max_length)
     test_prompt_dataset = PromptOnlyDataset(test_df, tokenizer, config.max_length)
 
     train_loader = DataLoader(
-        train_dataset,
+        train_prompt_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=pin_memory,
-        collate_fn=SupervisedCollator(tokenizer),
+        collate_fn=lambda batch: prompt_collate_fn(batch, tokenizer),
     )
     val_prompt_loader = DataLoader(
         val_prompt_dataset,
@@ -517,6 +472,11 @@ def train(config: TrainingConfig) -> None:
     use_amp = device.type == "cuda"
     amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
+    choice_token_ids = get_choice_token_ids(tokenizer)
+    candidate_ids = torch.tensor(
+        [choice_token_ids["A"], choice_token_ids["B"], choice_token_ids["C"], choice_token_ids["D"]],
+        device=device,
+    )
     history: List[Dict[str, float]] = []
     best_accuracy = -1.0
     epochs_without_improvement = 0
@@ -528,25 +488,20 @@ def train(config: TrainingConfig) -> None:
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.num_epochs}", leave=False)
 
         for step, batch in enumerate(progress_bar, start=1):
-            batch = MCQBatch(
-                input_ids=batch.input_ids.to(device),
-                attention_mask=batch.attention_mask.to(device),
-                labels=batch.labels.to(device),
-            )
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            targets = batch["target"].to(device, non_blocking=True)
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                outputs = model(
-                    input_ids=batch.input_ids,
-                    attention_mask=batch.attention_mask,
-                    labels=batch.labels,
-                )
-                loss = outputs.loss / config.grad_accum_steps
+                choice_logits = compute_choice_logits(model, input_ids, attention_mask, candidate_ids)
+                batch_loss = F.cross_entropy(choice_logits, targets)
+                loss = batch_loss / config.grad_accum_steps
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            running_loss += loss.item() * config.grad_accum_steps
+            running_loss += batch_loss.item()
 
             if step % config.grad_accum_steps == 0 or step == len(train_loader):
                 if scaler.is_enabled():
@@ -614,6 +569,7 @@ def train(config: TrainingConfig) -> None:
         "val_size": len(val_df),
         "test_size": len(test_df),
     }
+    save_json({"history": history}, run_dir / "history.json")
     save_json(metrics, run_dir / "metrics.json")
     torch.save(
         {
