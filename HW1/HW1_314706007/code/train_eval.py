@@ -38,15 +38,16 @@ class TrainingConfig:
     output_dir: str = "../saved_models/checkpoint"
     batch_size: int = 8
     eval_batch_size: int = 4
-    learning_rate: float = 1e-5
+    learning_rate: float = 7e-6
     num_epochs: int = 20
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
-    early_stopping_patience: int = 5
+    label_smoothing: float = 0.05
+    early_stopping_patience: int = 3
     early_stopping_min_delta: float = 0.0
-    max_length: int = 512
+    max_length: int = 1024
     grad_accum_steps: int = 4
-    val_ratio: float = 0.1
+    val_ratio: float = 0.2
     test_ratio: float = 0.1
     seed: int = 42
     num_workers: int = 4
@@ -494,7 +495,11 @@ def train(config: TrainingConfig) -> None:
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 choice_logits = compute_choice_logits(model, input_ids, attention_mask, candidate_ids)
-                batch_loss = F.cross_entropy(choice_logits, targets)
+                batch_loss = F.cross_entropy(
+                    choice_logits,
+                    targets,
+                    label_smoothing=config.label_smoothing,
+                )
                 loss = batch_loss / config.grad_accum_steps
 
             if scaler.is_enabled():
