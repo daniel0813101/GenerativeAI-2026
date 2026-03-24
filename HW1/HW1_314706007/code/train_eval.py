@@ -41,12 +41,12 @@ class TrainingConfig:
     eval_batch_size: int = 4
     learning_rate: float = 1e-5
     num_epochs: int = 20
-    weight_decay: float = 0.01
+    weight_decay: float = 0.02
     warmup_ratio: float = 0.1
-    label_smoothing: float = 0.05
-    early_stopping_patience: int = 3
+    label_smoothing: float = 0.1
+    early_stopping_patience: int = 10
     early_stopping_min_delta: float = 0.0
-    max_length: int = 512
+    max_length: int = 1024
     grad_accum_steps: int = 4
     val_ratio: float = 0.1
     test_ratio: float = 0.1
@@ -55,7 +55,7 @@ class TrainingConfig:
     use_lora: bool = True
     lora_r: int = 16
     lora_alpha: int = 32
-    lora_dropout: float = 0.05
+    lora_dropout: float = 0.1
     lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj"
 
 
