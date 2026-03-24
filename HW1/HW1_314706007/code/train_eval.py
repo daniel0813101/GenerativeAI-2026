@@ -36,18 +36,19 @@ class TrainingConfig:
     model_name: str = DEFAULT_MODEL_NAME
     dataset_csv: str = "../dataset/dataset.csv"
     output_dir: str = "../saved_models/checkpoint"
+    split_path: str = "../saved_models/splits/default_split.json"
     batch_size: int = 8
     eval_batch_size: int = 4
-    learning_rate: float = 7e-6
+    learning_rate: float = 1e-5
     num_epochs: int = 20
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
     label_smoothing: float = 0.05
     early_stopping_patience: int = 3
     early_stopping_min_delta: float = 0.0
-    max_length: int = 1024
+    max_length: int = 512
     grad_accum_steps: int = 4
-    val_ratio: float = 0.2
+    val_ratio: float = 0.1
     test_ratio: float = 0.1
     seed: int = 42
     num_workers: int = 4
@@ -423,6 +424,7 @@ def train(config: TrainingConfig) -> None:
         val_ratio=config.val_ratio,
         test_ratio=config.test_ratio,
         random_state=config.seed,
+        split_path=config.split_path,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)

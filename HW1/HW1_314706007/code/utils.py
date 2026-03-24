@@ -50,6 +50,7 @@ def split_dataframe(
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
     random_state: int = 42,
+    split_path: str | Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Split a labeled dataset into train, validation, and test DataFrames.
 
@@ -58,6 +59,9 @@ def split_dataframe(
         val_ratio: Fraction of samples assigned to the validation split.
         test_ratio: Fraction of samples assigned to the test split.
         random_state: Random seed used by ``train_test_split``.
+        split_path: Optional JSON path used to persist or reuse a fixed split
+            based on ``question_id`` values. If the file exists, the saved
+            split is loaded. Otherwise a new split is created and saved there.
 
     Returns:
         A tuple of ``(train_df, val_df, test_df)`` with reset indices.
@@ -65,6 +69,33 @@ def split_dataframe(
     Raises:
         ValueError: If the split ratios are invalid.
     """
+    if split_path is not None and Path(split_path).exists():
+        split_spec = load_json(split_path)
+        if "question_id" not in df.columns:
+            raise ValueError("A persisted split requires a 'question_id' column in the dataset.")
+
+        question_ids = {
+            "train": set(split_spec["train_question_ids"]),
+            "val": set(split_spec["val_question_ids"]),
+            "test": set(split_spec["test_question_ids"]),
+        }
+        all_saved_ids = question_ids["train"] | question_ids["val"] | question_ids["test"]
+        dataset_ids = set(df["question_id"].tolist())
+        if all_saved_ids != dataset_ids:
+            raise ValueError(
+                "Saved split does not match the current dataset question_id values. "
+                "Delete the split file or point to a compatible one."
+            )
+
+        train_df = df[df["question_id"].isin(question_ids["train"])]
+        val_df = df[df["question_id"].isin(question_ids["val"])]
+        test_df = df[df["question_id"].isin(question_ids["test"])]
+        return (
+            train_df.reset_index(drop=True),
+            val_df.reset_index(drop=True),
+            test_df.reset_index(drop=True),
+        )
+
     if val_ratio <= 0 or test_ratio <= 0:
         raise ValueError("val_ratio and test_ratio must both be greater than 0.")
     if val_ratio + test_ratio >= 1:
@@ -90,6 +121,26 @@ def split_dataframe(
         shuffle=True,
         stratify=temp_stratify,
     )
+
+    train_df = train_df.reset_index(drop=True)
+    val_df = val_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
+
+    if split_path is not None:
+        if "question_id" not in df.columns:
+            raise ValueError("A persisted split requires a 'question_id' column in the dataset.")
+        split_path = Path(split_path)
+        save_json(
+            {
+                "random_state": random_state,
+                "val_ratio": val_ratio,
+                "test_ratio": test_ratio,
+                "train_question_ids": train_df["question_id"].astype(int).tolist(),
+                "val_question_ids": val_df["question_id"].astype(int).tolist(),
+                "test_question_ids": test_df["question_id"].astype(int).tolist(),
+            },
+            split_path,
+        )
 
     return (
         train_df.reset_index(drop=True),
