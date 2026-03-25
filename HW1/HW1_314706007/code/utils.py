@@ -9,7 +9,7 @@ from typing import Dict, List, Sequence
 import matplotlib.pyplot as plt
 import pandas as pd
 import torch
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.nn.utils.rnn import pad_sequence
 
 
@@ -147,6 +147,85 @@ def split_dataframe(
         val_df.reset_index(drop=True),
         test_df.reset_index(drop=True),
     )
+
+
+def build_kfold_splits(
+    df: pd.DataFrame,
+    num_folds: int = 5,
+    random_state: int = 42,
+    split_path: str | Path | None = None,
+) -> List[tuple[pd.DataFrame, pd.DataFrame]]:
+    """Build or load fixed stratified k-fold train/validation splits.
+
+    Args:
+        df: Full labeled dataset.
+        num_folds: Number of folds to create.
+        random_state: Random seed used when creating the folds.
+        split_path: Optional JSON path used to persist or reuse the fold
+            assignments based on ``question_id`` values.
+
+    Returns:
+        A list of ``(train_df, val_df)`` tuples, one per fold.
+
+    Raises:
+        ValueError: If the dataset cannot support the requested number of folds
+            or if a persisted split does not match the current dataset.
+    """
+    if "ans" not in df.columns:
+        raise ValueError("K-fold training requires labeled data with an 'ans' column.")
+    if "question_id" not in df.columns:
+        raise ValueError("A persisted k-fold split requires a 'question_id' column in the dataset.")
+    if num_folds < 2:
+        raise ValueError("num_folds must be at least 2.")
+
+    if split_path is not None and Path(split_path).exists():
+        split_spec = load_json(split_path)
+        folds = split_spec["folds"]
+        all_saved_ids = set()
+        dataset_ids = set(df["question_id"].tolist())
+        split_pairs: List[tuple[pd.DataFrame, pd.DataFrame]] = []
+
+        for fold_spec in folds:
+            train_ids = set(fold_spec["train_question_ids"])
+            val_ids = set(fold_spec["val_question_ids"])
+            all_saved_ids |= train_ids | val_ids
+            train_df = df[df["question_id"].isin(train_ids)]
+            val_df = df[df["question_id"].isin(val_ids)]
+            split_pairs.append((train_df.reset_index(drop=True), val_df.reset_index(drop=True)))
+
+        if all_saved_ids != dataset_ids:
+            raise ValueError(
+                "Saved k-fold split does not match the current dataset question_id values. "
+                "Delete the split file or point to a compatible one."
+            )
+        return split_pairs
+
+    splitter = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=random_state)
+    split_pairs: List[tuple[pd.DataFrame, pd.DataFrame]] = []
+    fold_specs = []
+
+    for train_indices, val_indices in splitter.split(df, df["ans"]):
+        train_df = df.iloc[train_indices].reset_index(drop=True)
+        val_df = df.iloc[val_indices].reset_index(drop=True)
+        split_pairs.append((train_df, val_df))
+        fold_specs.append(
+            {
+                "train_question_ids": train_df["question_id"].astype(int).tolist(),
+                "val_question_ids": val_df["question_id"].astype(int).tolist(),
+            }
+        )
+
+    if split_path is not None:
+        save_json(
+            {
+                "random_state": random_state,
+                "num_folds": num_folds,
+                "folds": fold_specs,
+            },
+            split_path,
+        )
+
+    return split_pairs
 
 
 def build_prompt(row: pd.Series | Dict[str, object]) -> str:

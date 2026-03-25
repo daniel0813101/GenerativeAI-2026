@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 
 from utils import (
+    build_kfold_splits,
     build_prompt,
     compute_accuracy,
     get_choice_token_ids,
@@ -36,15 +37,18 @@ class TrainingConfig:
     model_name: str = DEFAULT_MODEL_NAME
     dataset_csv: str = "../dataset/dataset.csv"
     output_dir: str = "../saved_models/checkpoint"
+    use_kfold: bool = False
+    num_folds: int = 5
+    kfold_split_path: str = "../saved_models/splits/default_kfold_5.json"
     split_path: str = "../saved_models/splits/default_split.json"
     batch_size: int = 8
     eval_batch_size: int = 4
     learning_rate: float = 1e-5
-    num_epochs: int = 20
+    num_epochs: int = 50
     weight_decay: float = 0.02
     warmup_ratio: float = 0.1
     label_smoothing: float = 0.1
-    early_stopping_patience: int = 10
+    early_stopping_patience: int = 40
     early_stopping_min_delta: float = 0.0
     max_length: int = 1024
     grad_accum_steps: int = 4
@@ -408,24 +412,28 @@ def create_run_dir(output_root: str | Path) -> Path:
     return run_dir
 
 
-def train(config: TrainingConfig) -> None:
-    """Run baseline training, validation, and held-out test evaluation.
+def train_one_split(
+    config: TrainingConfig,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    run_dir: Path,
+    device: torch.device,
+    test_df: pd.DataFrame | None = None,
+) -> Dict[str, object]:
+    """Train and evaluate one train/validation split.
 
     Args:
         config: Training configuration values.
+        train_df: Labeled training split.
+        val_df: Labeled validation split.
+        run_dir: Output directory for this training run.
+        device: Device used for training and evaluation.
+        test_df: Optional held-out labeled test split for evaluation.
+
+    Returns:
+        A metrics dictionary summarizing the run.
     """
     set_seed(config.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run_dir = create_run_dir(config.output_dir)
-
-    full_df = load_dataset(config.dataset_csv)
-    train_df, val_df, test_df = split_dataframe(
-        full_df,
-        val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio,
-        random_state=config.seed,
-        split_path=config.split_path,
-    )
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
@@ -436,7 +444,11 @@ def train(config: TrainingConfig) -> None:
 
     train_prompt_dataset = PromptOnlyDataset(train_df, tokenizer, config.max_length)
     val_prompt_dataset = PromptOnlyDataset(val_df, tokenizer, config.max_length)
-    test_prompt_dataset = PromptOnlyDataset(test_df, tokenizer, config.max_length)
+    test_prompt_dataset = (
+        PromptOnlyDataset(test_df, tokenizer, config.max_length)
+        if test_df is not None
+        else None
+    )
 
     train_loader = DataLoader(
         train_prompt_dataset,
@@ -454,13 +466,17 @@ def train(config: TrainingConfig) -> None:
         pin_memory=pin_memory,
         collate_fn=lambda batch: prompt_collate_fn(batch, tokenizer),
     )
-    test_prompt_loader = DataLoader(
-        test_prompt_dataset,
-        batch_size=config.eval_batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=pin_memory,
-        collate_fn=lambda batch: prompt_collate_fn(batch, tokenizer),
+    test_prompt_loader = (
+        DataLoader(
+            test_prompt_dataset,
+            batch_size=config.eval_batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=pin_memory,
+            collate_fn=lambda batch: prompt_collate_fn(batch, tokenizer),
+        )
+        if test_prompt_dataset is not None
+        else None
     )
 
     optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
@@ -556,26 +572,27 @@ def train(config: TrainingConfig) -> None:
 
     best_model = load_saved_model(run_dir, tokenizer, device)
 
-    test_predictions_df = collect_predictions(best_model, test_prompt_loader, tokenizer, device)
-    test_accuracy = compute_accuracy(
-        test_predictions_df["prediction"].tolist(),
-        test_predictions_df["target"].tolist(),
-    )
-    test_predictions_df.to_csv(run_dir / "test_predictions.csv", index=False)
-    plot_test_results(
-        predictions=test_predictions_df["prediction"].tolist(),
-        references=test_predictions_df["target"].tolist(),
-        save_path=run_dir / "test_results.png",
-    )
-
     metrics = {
         "run_dir": str(run_dir),
         "best_val_accuracy": best_accuracy,
-        "test_accuracy": test_accuracy,
         "train_size": len(train_df),
         "val_size": len(val_df),
-        "test_size": len(test_df),
     }
+    if test_prompt_loader is not None and test_df is not None:
+        test_predictions_df = collect_predictions(best_model, test_prompt_loader, tokenizer, device)
+        test_accuracy = compute_accuracy(
+            test_predictions_df["prediction"].tolist(),
+            test_predictions_df["target"].tolist(),
+        )
+        test_predictions_df.to_csv(run_dir / "test_predictions.csv", index=False)
+        plot_test_results(
+            predictions=test_predictions_df["prediction"].tolist(),
+            references=test_predictions_df["target"].tolist(),
+            save_path=run_dir / "test_results.png",
+        )
+        metrics["test_accuracy"] = test_accuracy
+        metrics["test_size"] = len(test_df)
+
     save_json({"history": history}, run_dir / "history.json")
     save_json(metrics, run_dir / "metrics.json")
     torch.save(
@@ -588,7 +605,71 @@ def train(config: TrainingConfig) -> None:
         run_dir / "training_state.pt",
     )
     print(f"Saved run outputs to {run_dir}")
-    print(f"Final held-out test accuracy: {test_accuracy:.4f}")
+    if "test_accuracy" in metrics:
+        print(f"Final held-out test accuracy: {metrics['test_accuracy']:.4f}")
+    return metrics
+
+
+def train(config: TrainingConfig) -> None:
+    """Run either the original split workflow or optional k-fold training.
+
+    Args:
+        config: Training configuration values.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    run_dir = create_run_dir(config.output_dir)
+    save_json(asdict(config), run_dir / "train_config.json")
+
+    full_df = load_dataset(config.dataset_csv)
+
+    if config.use_kfold:
+        fold_splits = build_kfold_splits(
+            full_df,
+            num_folds=config.num_folds,
+            random_state=config.seed,
+            split_path=config.kfold_split_path,
+        )
+        fold_metrics = []
+        for fold_index, (train_df, val_df) in enumerate(fold_splits, start=1):
+            fold_run_dir = run_dir / f"fold_{fold_index}"
+            print(f"Starting fold {fold_index}/{config.num_folds}")
+            fold_metrics.append(
+                train_one_split(
+                    config=config,
+                    train_df=train_df,
+                    val_df=val_df,
+                    run_dir=fold_run_dir,
+                    device=device,
+                    test_df=None,
+                )
+            )
+
+        summary = {
+            "run_dir": str(run_dir),
+            "num_folds": config.num_folds,
+            "mean_best_val_accuracy": sum(metric["best_val_accuracy"] for metric in fold_metrics) / max(len(fold_metrics), 1),
+            "fold_metrics": fold_metrics,
+        }
+        save_json(summary, run_dir / "cv_metrics.json")
+        print(f"Saved k-fold outputs to {run_dir}")
+        print(f"Mean best validation accuracy across folds: {summary['mean_best_val_accuracy']:.4f}")
+        return
+
+    train_df, val_df, test_df = split_dataframe(
+        full_df,
+        val_ratio=config.val_ratio,
+        test_ratio=config.test_ratio,
+        random_state=config.seed,
+        split_path=config.split_path,
+    )
+    train_one_split(
+        config=config,
+        train_df=train_df,
+        val_df=val_df,
+        run_dir=run_dir,
+        device=device,
+        test_df=test_df,
+    )
 
 
 def parse_args() -> TrainingConfig:
