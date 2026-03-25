@@ -4,7 +4,7 @@ import argparse
 from datetime import datetime
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import pandas as pd
 import torch
@@ -20,11 +20,14 @@ from utils import (
     build_prompt,
     compute_accuracy,
     get_choice_token_ids,
+    get_option_permutations,
     load_dataset,
     plot_test_results,
     plot_training_history,
+    restore_permuted_choice_logits,
     save_json,
     set_seed,
+    permute_answer_options,
     shuffle_answer_options,
     split_dataframe,
 )
@@ -50,6 +53,8 @@ class TrainingConfig:
     warmup_ratio: float = 0.1
     label_smoothing: float = 0.1
     shuffle_option_augmentation: bool = True
+    option_order_ensemble: bool = False
+    num_option_order_permutations: int = 4
     early_stopping_patience: int = 40
     early_stopping_min_delta: float = 0.0
     max_length: int = 1024
@@ -72,6 +77,7 @@ class PromptOnlyDataset(Dataset):
         tokenizer,
         max_length: int,
         shuffle_options: bool = False,
+        option_permutation: Sequence[int] | None = None,
     ) -> None:
         """Build prompt-only examples for evaluation or inference.
 
@@ -81,11 +87,14 @@ class PromptOnlyDataset(Dataset):
             max_length: Maximum prompt length.
             shuffle_options: Whether to randomly permute answer option order
                 and remap labels when building each training example.
+            option_permutation: Optional deterministic permutation applied to
+                the answer options for each example.
         """
         self.dataframe = dataframe.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.shuffle_options = shuffle_options
+        self.option_permutation = list(option_permutation) if option_permutation is not None else None
         self.examples = None if shuffle_options else [self._build_example(index) for index in range(len(self.dataframe))]
 
     def __len__(self) -> int:
@@ -95,7 +104,9 @@ class PromptOnlyDataset(Dataset):
     def _build_example(self, index: int) -> Dict[str, torch.Tensor]:
         """Tokenize and cache one prompt-only example."""
         row = self.dataframe.iloc[index]
-        if self.shuffle_options:
+        if self.option_permutation is not None:
+            row = permute_answer_options(row, self.option_permutation)
+        elif self.shuffle_options:
             row = shuffle_answer_options(row)
         prompt = build_prompt(row)
         encoded = self.tokenizer(
@@ -175,6 +186,180 @@ def compute_choice_logits(
     batch_indices = torch.arange(input_ids.size(0), device=input_ids.device)
     next_token_logits = outputs.logits[batch_indices, last_indices]
     return next_token_logits.index_select(dim=-1, index=candidate_ids)
+
+
+def create_prompt_dataloader(
+    dataframe: pd.DataFrame,
+    tokenizer,
+    max_length: int,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    option_permutation: Sequence[int] | None = None,
+) -> DataLoader:
+    """Create a prompt-only dataloader, optionally with deterministic option order."""
+    dataset = PromptOnlyDataset(
+        dataframe,
+        tokenizer,
+        max_length=max_length,
+        option_permutation=option_permutation,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=lambda batch: prompt_collate_fn(batch, tokenizer),
+    )
+
+
+def collect_choice_logits_from_dataloader(
+    model,
+    dataloader: DataLoader,
+    tokenizer,
+    device: torch.device,
+) -> tuple[torch.Tensor, List[int], List[int] | None]:
+    """Collect per-example answer-choice logits from a prompt dataloader."""
+    model.eval()
+    choice_token_ids = get_choice_token_ids(tokenizer)
+    candidate_ids = torch.tensor([choice_token_ids["A"], choice_token_ids["B"], choice_token_ids["C"], choice_token_ids["D"]], device=device)
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
+    logits_batches = []
+    question_ids: List[int] = []
+    targets: List[int] = []
+    has_targets = False
+
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                choice_logits = compute_choice_logits(model, input_ids, attention_mask, candidate_ids)
+            logits_batches.append(choice_logits.detach().cpu())
+            question_ids.extend(batch["question_id"].tolist())
+            if "target" in batch:
+                has_targets = True
+                targets.extend(batch["target"].tolist())
+
+    return torch.cat(logits_batches, dim=0), question_ids, targets if has_targets else None
+
+
+def collect_choice_logits_from_dataframe(
+    model,
+    dataframe: pd.DataFrame,
+    tokenizer,
+    device: torch.device,
+    max_length: int,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    option_order_ensemble: bool = False,
+    num_option_order_permutations: int = 4,
+) -> tuple[torch.Tensor, List[int], List[int] | None]:
+    """Collect answer-choice logits, optionally averaged over option permutations."""
+    num_permutations = num_option_order_permutations if option_order_ensemble else 1
+    permutations = get_option_permutations(num_permutations)
+    ensemble_logits = None
+    question_ids: List[int] | None = None
+    targets: List[int] | None = None
+
+    for permutation in permutations:
+        dataloader = create_prompt_dataloader(
+            dataframe,
+            tokenizer,
+            max_length=max_length,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            option_permutation=permutation,
+        )
+        permutation_logits, batch_question_ids, batch_targets = collect_choice_logits_from_dataloader(
+            model,
+            dataloader,
+            tokenizer,
+            device,
+        )
+        restored_logits = restore_permuted_choice_logits(permutation_logits, permutation)
+
+        if ensemble_logits is None:
+            ensemble_logits = restored_logits
+            question_ids = batch_question_ids
+            targets = batch_targets
+        else:
+            if batch_question_ids != question_ids:
+                raise ValueError("Option-order ensemble produced a different question ordering.")
+            ensemble_logits += restored_logits
+
+    return ensemble_logits / len(permutations), question_ids or [], targets
+
+
+def evaluate_choice_loss_from_dataframe(
+    model,
+    dataframe: pd.DataFrame,
+    tokenizer,
+    device: torch.device,
+    max_length: int,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    option_order_ensemble: bool = False,
+    num_option_order_permutations: int = 4,
+) -> float:
+    """Compute choice loss from a dataframe, optionally with option-order ensembling."""
+    choice_logits, _, targets = collect_choice_logits_from_dataframe(
+        model,
+        dataframe,
+        tokenizer,
+        device,
+        max_length=max_length,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        option_order_ensemble=option_order_ensemble,
+        num_option_order_permutations=num_option_order_permutations,
+    )
+    if targets is None:
+        raise ValueError("Choice loss requires labeled examples.")
+    return F.cross_entropy(choice_logits, torch.tensor(targets, dtype=torch.long)).item()
+
+
+def collect_predictions_from_dataframe(
+    model,
+    dataframe: pd.DataFrame,
+    tokenizer,
+    device: torch.device,
+    max_length: int,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    option_order_ensemble: bool = False,
+    num_option_order_permutations: int = 4,
+) -> pd.DataFrame:
+    """Collect predictions from a dataframe, optionally averaged over option order."""
+    choice_logits, question_ids, targets = collect_choice_logits_from_dataframe(
+        model,
+        dataframe,
+        tokenizer,
+        device,
+        max_length=max_length,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        option_order_ensemble=option_order_ensemble,
+        num_option_order_permutations=num_option_order_permutations,
+    )
+    predictions = choice_logits.argmax(dim=-1).tolist()
+    rows = []
+    target_values = targets if targets is not None else [None] * len(predictions)
+    for question_id, prediction, target in zip(question_ids, predictions, target_values):
+        row = {"question_id": question_id, "prediction": prediction}
+        if target is not None:
+            row["target"] = target
+            row["correct"] = int(prediction == target)
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def evaluate_choice_loss(
@@ -558,8 +743,38 @@ def train_one_split(
             progress_bar.set_postfix(loss=f"{running_loss / step:.4f}")
 
         train_loss = running_loss / max(len(train_loader), 1)
-        val_loss = evaluate_choice_loss(model, val_prompt_loader, tokenizer, device)
-        val_accuracy = evaluate_accuracy(model, val_prompt_loader, tokenizer, device)
+        if config.option_order_ensemble:
+            val_loss = evaluate_choice_loss_from_dataframe(
+                model,
+                val_df,
+                tokenizer,
+                device,
+                max_length=config.max_length,
+                batch_size=config.eval_batch_size,
+                num_workers=config.num_workers,
+                pin_memory=pin_memory,
+                option_order_ensemble=True,
+                num_option_order_permutations=config.num_option_order_permutations,
+            )
+            val_predictions_df = collect_predictions_from_dataframe(
+                model,
+                val_df,
+                tokenizer,
+                device,
+                max_length=config.max_length,
+                batch_size=config.eval_batch_size,
+                num_workers=config.num_workers,
+                pin_memory=pin_memory,
+                option_order_ensemble=True,
+                num_option_order_permutations=config.num_option_order_permutations,
+            )
+            val_accuracy = compute_accuracy(
+                val_predictions_df["prediction"].tolist(),
+                val_predictions_df["target"].tolist(),
+            )
+        else:
+            val_loss = evaluate_choice_loss(model, val_prompt_loader, tokenizer, device)
+            val_accuracy = evaluate_accuracy(model, val_prompt_loader, tokenizer, device)
 
         epoch_log = {
             "epoch": epoch,
@@ -599,7 +814,21 @@ def train_one_split(
         "val_size": len(val_df),
     }
     if test_prompt_loader is not None and test_df is not None:
-        test_predictions_df = collect_predictions(best_model, test_prompt_loader, tokenizer, device)
+        if config.option_order_ensemble:
+            test_predictions_df = collect_predictions_from_dataframe(
+                best_model,
+                test_df,
+                tokenizer,
+                device,
+                max_length=config.max_length,
+                batch_size=config.eval_batch_size,
+                num_workers=config.num_workers,
+                pin_memory=pin_memory,
+                option_order_ensemble=True,
+                num_option_order_permutations=config.num_option_order_permutations,
+            )
+        else:
+            test_predictions_df = collect_predictions(best_model, test_prompt_loader, tokenizer, device)
         test_accuracy = compute_accuracy(
             test_predictions_df["prediction"].tolist(),
             test_predictions_df["target"].tolist(),

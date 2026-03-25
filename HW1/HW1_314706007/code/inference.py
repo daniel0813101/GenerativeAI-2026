@@ -6,11 +6,10 @@ from typing import Sequence
 
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-from train_eval import PromptOnlyDataset, compute_choice_logits, load_saved_model, prompt_collate_fn
-from utils import ID_TO_LABEL, get_choice_token_ids, load_dataset
+from train_eval import collect_choice_logits_from_dataframe, load_saved_model
+from utils import ID_TO_LABEL, load_dataset
 
 
 def run_inference(
@@ -19,6 +18,8 @@ def run_inference(
     output_csv: str | Path | None,
     max_length: int = 512,
     batch_size: int = 4,
+    option_order_ensemble: bool = False,
+    num_option_order_permutations: int = 4,
 ) -> None:
     """Run benchmark inference and export predictions to CSV.
 
@@ -29,53 +30,40 @@ def run_inference(
             is saved inside the first model directory as ``submission.csv``.
         max_length: Maximum prompt length.
         batch_size: Evaluation batch size.
+        option_order_ensemble: Whether to average logits across several answer
+            option permutations for each example.
+        num_option_order_permutations: Number of permutations used when
+            ``option_order_ensemble`` is enabled.
     """
     model_dirs = [Path(model_dir) for model_dir in model_dirs]
     if not model_dirs:
         raise ValueError("At least one model directory must be provided for inference.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = device.type == "cuda"
-    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
 
     tokenizer = AutoTokenizer.from_pretrained(model_dirs[0])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     benchmark_df = load_dataset(benchmark_csv)
-    dataset = PromptOnlyDataset(benchmark_df, tokenizer, max_length=max_length)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=lambda batch: prompt_collate_fn(batch, tokenizer),
-    )
-
-    choice_token_ids = get_choice_token_ids(tokenizer)
-    candidate_ids = torch.tensor(
-        [choice_token_ids["A"], choice_token_ids["B"], choice_token_ids["C"], choice_token_ids["D"]],
-        device=device,
-    )
-
     ensemble_logits = None
     question_ids = None
 
     for model_dir in model_dirs:
         model = load_saved_model(model_dir, tokenizer, device)
         model.eval()
-        model_logits = []
-        batch_question_ids = []
-
-        with torch.no_grad():
-            for batch in dataloader:
-                input_ids = batch["input_ids"].to(device, non_blocking=True)
-                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                    choice_logits = compute_choice_logits(model, input_ids, attention_mask, candidate_ids)
-                model_logits.append(choice_logits.detach().cpu())
-                batch_question_ids.extend(batch["question_id"].tolist())
-
-        stacked_logits = torch.cat(model_logits, dim=0)
+        stacked_logits, batch_question_ids, _ = collect_choice_logits_from_dataframe(
+            model,
+            benchmark_df,
+            tokenizer,
+            device,
+            max_length=max_length,
+            batch_size=batch_size,
+            num_workers=0,
+            pin_memory=device.type == "cuda",
+            option_order_ensemble=option_order_ensemble,
+            num_option_order_permutations=num_option_order_permutations,
+        )
         if ensemble_logits is None:
             ensemble_logits = stacked_logits
             question_ids = batch_question_ids
@@ -96,6 +84,8 @@ def run_inference(
     submission.to_csv(output_csv, index=False)
     print(f"Saved submission to {output_csv}")
     print("Ensembled checkpoints:", [str(model_dir) for model_dir in model_dirs])
+    if option_order_ensemble:
+        print(f"Option-order permutations per checkpoint: {num_option_order_permutations}")
     print("Answer mapping:", ID_TO_LABEL)
 
 
@@ -111,6 +101,8 @@ def parse_args():
     parser.add_argument("--output_csv", type=str, default=None)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--option_order_ensemble", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--num_option_order_permutations", type=int, default=4)
     return parser.parse_args()
 
 
@@ -122,4 +114,6 @@ if __name__ == "__main__":
         output_csv=args.output_csv,
         max_length=args.max_length,
         batch_size=args.batch_size,
+        option_order_ensemble=args.option_order_ensemble,
+        num_option_order_permutations=args.num_option_order_permutations,
     )

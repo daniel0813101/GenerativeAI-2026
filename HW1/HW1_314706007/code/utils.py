@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 import random
 from dataclasses import dataclass
@@ -250,6 +251,32 @@ def build_prompt(row: pd.Series | Dict[str, object]) -> str:
     )
 
 
+def permute_answer_options(row: pd.Series | Dict[str, object], permutation: Sequence[int]) -> Dict[str, object]:
+    """Permute MCQ options deterministically and remap the label if present.
+
+    Args:
+        row: A dataset row containing the question, options, and optional
+            integer answer label.
+        permutation: Mapping from new option index to original option index.
+
+    Returns:
+        A dictionary with permuted option text and a remapped ``ans`` label
+        when the input row contains one.
+    """
+    if len(permutation) != len(OPTION_COLUMNS):
+        raise ValueError(f"Expected {len(OPTION_COLUMNS)} permutation entries, got {len(permutation)}.")
+
+    permuted_row = dict(row)
+    for new_index, old_index in enumerate(permutation):
+        permuted_row[OPTION_COLUMNS[new_index]] = row[OPTION_COLUMNS[old_index]]
+
+    if "ans" in row:
+        original_answer = int(row["ans"])
+        permuted_row["ans"] = list(permutation).index(original_answer)
+
+    return permuted_row
+
+
 def shuffle_answer_options(row: pd.Series | Dict[str, object]) -> Dict[str, object]:
     """Shuffle MCQ answer options and remap the label if present.
 
@@ -261,18 +288,49 @@ def shuffle_answer_options(row: pd.Series | Dict[str, object]) -> Dict[str, obje
         A dictionary with shuffled option text. If ``ans`` exists in ``row``,
         it is remapped to the new option index after shuffling.
     """
-    shuffled_row = dict(row)
     permutation = list(range(len(OPTION_COLUMNS)))
     random.shuffle(permutation)
+    return permute_answer_options(row, permutation)
 
+
+def get_option_permutations(num_permutations: int = 4) -> List[List[int]]:
+    """Return a deterministic list of answer-option permutations.
+
+    Args:
+        num_permutations: Number of permutations to return, including the
+            identity permutation.
+
+    Returns:
+        A list of permutations, each mapping new option index to original
+        option index.
+
+    Raises:
+        ValueError: If ``num_permutations`` is outside ``[1, 24]`` for four
+            answer options.
+    """
+    max_permutations = 1
+    for value in range(2, len(OPTION_COLUMNS) + 1):
+        max_permutations *= value
+    if num_permutations < 1 or num_permutations > max_permutations:
+        raise ValueError(f"num_permutations must be between 1 and {max_permutations}.")
+    return [list(permutation) for permutation in itertools.islice(itertools.permutations(range(len(OPTION_COLUMNS))), num_permutations)]
+
+
+def restore_permuted_choice_logits(choice_logits: torch.Tensor, permutation: Sequence[int]) -> torch.Tensor:
+    """Map logits from a permuted option order back to the original order.
+
+    Args:
+        choice_logits: Tensor of shape ``(..., 4)`` in permuted option order.
+        permutation: Mapping from new option index to original option index.
+
+    Returns:
+        A tensor with the same shape as ``choice_logits`` in the original
+        ``A/B/C/D`` order.
+    """
+    restored_logits = torch.empty_like(choice_logits)
     for new_index, old_index in enumerate(permutation):
-        shuffled_row[OPTION_COLUMNS[new_index]] = row[OPTION_COLUMNS[old_index]]
-
-    if "ans" in row:
-        original_answer = int(row["ans"])
-        shuffled_row["ans"] = permutation.index(original_answer)
-
-    return shuffled_row
+        restored_logits[..., old_index] = choice_logits[..., new_index]
+    return restored_logits
 
 
 def label_id_to_text(label_id: int) -> str:
