@@ -250,6 +250,31 @@ def build_prompt(row: pd.Series | Dict[str, object]) -> str:
     )
 
 
+def shuffle_answer_options(row: pd.Series | Dict[str, object]) -> Dict[str, object]:
+    """Shuffle MCQ answer options and remap the label if present.
+
+    Args:
+        row: A dataset row containing the question, options, and optional
+            integer answer label.
+
+    Returns:
+        A dictionary with shuffled option text. If ``ans`` exists in ``row``,
+        it is remapped to the new option index after shuffling.
+    """
+    shuffled_row = dict(row)
+    permutation = list(range(len(OPTION_COLUMNS)))
+    random.shuffle(permutation)
+
+    for new_index, old_index in enumerate(permutation):
+        shuffled_row[OPTION_COLUMNS[new_index]] = row[OPTION_COLUMNS[old_index]]
+
+    if "ans" in row:
+        original_answer = int(row["ans"])
+        shuffled_row["ans"] = permutation.index(original_answer)
+
+    return shuffled_row
+
+
 def label_id_to_text(label_id: int) -> str:
     """Convert an integer class id into an option letter.
 

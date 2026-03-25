@@ -25,6 +25,7 @@ from utils import (
     plot_training_history,
     save_json,
     set_seed,
+    shuffle_answer_options,
     split_dataframe,
 )
 
@@ -48,6 +49,7 @@ class TrainingConfig:
     weight_decay: float = 0.02
     warmup_ratio: float = 0.1
     label_smoothing: float = 0.1
+    shuffle_option_augmentation: bool = True
     early_stopping_patience: int = 40
     early_stopping_min_delta: float = 0.0
     max_length: int = 1024
@@ -64,26 +66,37 @@ class TrainingConfig:
 
 
 class PromptOnlyDataset(Dataset):
-    def __init__(self, dataframe: pd.DataFrame, tokenizer, max_length: int) -> None:
+    def __init__(
+        self,
+        dataframe: pd.DataFrame,
+        tokenizer,
+        max_length: int,
+        shuffle_options: bool = False,
+    ) -> None:
         """Build prompt-only examples for evaluation or inference.
 
         Args:
             dataframe: MCQ samples with or without labels.
             tokenizer: Tokenizer used to encode prompts.
             max_length: Maximum prompt length.
+            shuffle_options: Whether to randomly permute answer option order
+                and remap labels when building each training example.
         """
         self.dataframe = dataframe.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.examples = [self._build_example(index) for index in range(len(self.dataframe))]
+        self.shuffle_options = shuffle_options
+        self.examples = None if shuffle_options else [self._build_example(index) for index in range(len(self.dataframe))]
 
     def __len__(self) -> int:
         """Return the number of rows in the dataset."""
-        return len(self.examples)
+        return len(self.dataframe)
 
     def _build_example(self, index: int) -> Dict[str, torch.Tensor]:
         """Tokenize and cache one prompt-only example."""
         row = self.dataframe.iloc[index]
+        if self.shuffle_options:
+            row = shuffle_answer_options(row)
         prompt = build_prompt(row)
         encoded = self.tokenizer(
             prompt,
@@ -107,7 +120,9 @@ class PromptOnlyDataset(Dataset):
         Returns:
             A dictionary containing tokenized prompt tensors and metadata.
         """
-        return self.examples[index]
+        if self.examples is not None:
+            return self.examples[index]
+        return self._build_example(index)
 
 
 def prompt_collate_fn(features: List[Dict[str, torch.Tensor]], tokenizer) -> Dict[str, torch.Tensor]:
@@ -442,7 +457,12 @@ def train_one_split(
     model = create_model(config, tokenizer, device)
     pin_memory = device.type == "cuda"
 
-    train_prompt_dataset = PromptOnlyDataset(train_df, tokenizer, config.max_length)
+    train_prompt_dataset = PromptOnlyDataset(
+        train_df,
+        tokenizer,
+        config.max_length,
+        shuffle_options=config.shuffle_option_augmentation,
+    )
     val_prompt_dataset = PromptOnlyDataset(val_df, tokenizer, config.max_length)
     test_prompt_dataset = (
         PromptOnlyDataset(test_df, tokenizer, config.max_length)
