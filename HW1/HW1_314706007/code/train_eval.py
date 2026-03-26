@@ -53,7 +53,7 @@ class TrainingConfig:
     warmup_ratio: float = 0.1
     label_smoothing: float = 0.1
     shuffle_option_augmentation: bool = True
-    option_order_ensemble: bool = False
+    option_order_ensemble: bool = True
     num_option_order_permutations: int = 4
     early_stopping_patience: int = 40
     early_stopping_min_delta: float = 0.0
@@ -117,7 +117,7 @@ class PromptOnlyDataset(Dataset):
             return_tensors="pt",
         )
         item = {key: value.squeeze(0) for key, value in encoded.items()}
-        if "ans" in row.index:
+        if "ans" in row:
             item["target"] = torch.tensor(int(row["ans"]), dtype=torch.long)
         item["question_id"] = torch.tensor(int(row["question_id"]), dtype=torch.long)
         return item
