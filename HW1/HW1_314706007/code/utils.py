@@ -243,7 +243,7 @@ def build_kfold_splits(
 
 
 def build_prompt(row: pd.Series | Dict[str, object]) -> str:
-    """Format one MCQ row into the baseline instruction prompt.
+    """Format one MCQ row into an optimized two-shot instruction prompt.
 
     Args:
         row: A dataset row containing the question and options.
@@ -251,9 +251,43 @@ def build_prompt(row: pd.Series | Dict[str, object]) -> str:
     Returns:
         The prompt string given to the language model.
     """
+    system_persona = (
+        "You are an expert, dual-board-certified anatomical and clinical pathologist "
+        "taking a high-stakes medical licensing examination. Your task is to critically evaluate "
+        "the patient's clinical presentation, histopathological findings, and molecular markers "
+        "to determine the single best answer. You must synthesize complex medical data with "
+        "absolute clinical precision. Output strictly the letter of the correct option (A, B, C, or D).\n\n"
+    )
+
+    few_shot_examples = (
+        "Question:\n"
+        "A 45-year-old man presents with a painless neck mass. Biopsy reveals large cells "
+        "with multilobated nuclei and prominent nucleoli resembling 'popcorn' cells. "
+        "What is the most likely diagnosis?\n\n"
+        "Options:\n"
+        "A. Nodular lymphocyte predominant Hodgkin lymphoma\n"
+        "B. Nodular sclerosis Hodgkin lymphoma\n"
+        "C. Burkitt lymphoma\n"
+        "D. Follicular lymphoma\n\n"
+        "Answer: A\n\n"
+        "---\n\n"
+        "Question:\n"
+        "A 32-year-old woman undergoes a routine cervical cytology screen. The pathologist notes "
+        "scattered squamous epithelial cells characterized by enlarged, hyperchromatic nuclei with "
+        "irregular contours, surrounded by a distinct, clear perinuclear halo. Which of the following "
+        "is the most likely cause of these specific cellular changes?\n\n"
+        "Options:\n"
+        "A. Candida albicans infection\n"
+        "B. Trichomonas vaginalis infection\n"
+        "C. Herpes simplex virus (HSV) infection\n"
+        "D. Human papillomavirus (HPV) infection\n\n"
+        "Answer: D\n\n"
+        "---\n\n"
+    )
+
     return (
-        "You are a medical pathology question answering assistant.\n"
-        "Read the multiple-choice question and return only the correct option letter.\n\n"
+        f"{system_persona}"
+        f"{few_shot_examples}"
         f"Question:\n{row['question']}\n\n"
         "Options:\n"
         f"A. {row['opa']}\n"
