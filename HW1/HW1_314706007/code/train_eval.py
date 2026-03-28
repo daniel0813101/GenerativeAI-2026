@@ -13,7 +13,7 @@ from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 
 from utils import (
     build_kfold_splits,
@@ -49,7 +49,7 @@ class TrainingConfig:
     tuning_split_path: str = "../saved_models/splits/default_train_val_split.json"
     batch_size: int = 8
     eval_batch_size: int = 4
-    learning_rate: float = 1e-5
+    learning_rate: float = 5e-5
     num_epochs: int = 30
     weight_decay: float = 0.02
     warmup_ratio: float = 0.1
@@ -67,9 +67,9 @@ class TrainingConfig:
     num_workers: int = 4
     use_lora: bool = True
     lora_r: int = 16
-    lora_alpha: int = 32
+    lora_alpha: int = 16
     lora_dropout: float = 0.1
-    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj"
+    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
 
 
 class PromptOnlyDataset(Dataset):
@@ -689,7 +689,7 @@ def train_one_split(
     optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     total_steps = max(len(train_loader) * config.num_epochs // config.grad_accum_steps, 1)
     warmup_steps = int(total_steps * config.warmup_ratio)
-    scheduler = get_linear_schedule_with_warmup(
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=warmup_steps,
         num_training_steps=total_steps,
