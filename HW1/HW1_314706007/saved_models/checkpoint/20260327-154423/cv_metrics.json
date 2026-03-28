@@ -1,0 +1,54 @@
+{
+  "run_dir": "../saved_models/checkpoint/20260327-154423",
+  "selection_metric": "mean_best_val_accuracy",
+  "selection_score": 0.7118888888888889,
+  "num_folds": 5,
+  "mean_best_val_accuracy": 0.7118888888888889,
+  "fold_metrics": [
+    {
+      "run_dir": "../saved_models/checkpoint/20260327-154423/fold_1",
+      "selection_metric": "best_val_accuracy",
+      "selection_score": 0.7038888888888889,
+      "best_val_accuracy": 0.7038888888888889,
+      "evaluation_mode": "validation_only",
+      "train_size": 7200,
+      "val_size": 1800
+    },
+    {
+      "run_dir": "../saved_models/checkpoint/20260327-154423/fold_2",
+      "selection_metric": "best_val_accuracy",
+      "selection_score": 0.7322222222222222,
+      "best_val_accuracy": 0.7322222222222222,
+      "evaluation_mode": "validation_only",
+      "train_size": 7200,
+      "val_size": 1800
+    },
+    {
+      "run_dir": "../saved_models/checkpoint/20260327-154423/fold_3",
+      "selection_metric": "best_val_accuracy",
+      "selection_score": 0.705,
+      "best_val_accuracy": 0.705,
+      "evaluation_mode": "validation_only",
+      "train_size": 7200,
+      "val_size": 1800
+    },
+    {
+      "run_dir": "../saved_models/checkpoint/20260327-154423/fold_4",
+      "selection_metric": "best_val_accuracy",
+      "selection_score": 0.7233333333333334,
+      "best_val_accuracy": 0.7233333333333334,
+      "evaluation_mode": "validation_only",
+      "train_size": 7200,
+      "val_size": 1800
+    },
+    {
+      "run_dir": "../saved_models/checkpoint/20260327-154423/fold_5",
+      "selection_metric": "best_val_accuracy",
+      "selection_score": 0.695,
+      "best_val_accuracy": 0.695,
+      "evaluation_mode": "validation_only",
+      "train_size": 7200,
+      "val_size": 1800
+    }
+  ]
+}

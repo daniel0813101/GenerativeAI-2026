@@ -1,0 +1,9 @@
+{
+  "run_dir": "../saved_models/checkpoint/20260327-154423/fold_4",
+  "selection_metric": "best_val_accuracy",
+  "selection_score": 0.7233333333333334,
+  "best_val_accuracy": 0.7233333333333334,
+  "evaluation_mode": "validation_only",
+  "train_size": 7200,
+  "val_size": 1800
+}

@@ -53,7 +53,7 @@ def split_dataframe(
     random_state: int = 42,
     split_path: str | Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split a labeled dataset into train, validation, and test DataFrames.
+    """Split a labeled dataset into train/validation and optional test DataFrames.
 
     Args:
         df: Full labeled dataset.
@@ -65,7 +65,8 @@ def split_dataframe(
             split is loaded. Otherwise a new split is created and saved there.
 
     Returns:
-        A tuple of ``(train_df, val_df, test_df)`` with reset indices.
+        A tuple of ``(train_df, val_df, test_df)`` with reset indices. When
+        ``test_ratio`` is ``0``, the returned ``test_df`` is empty.
 
     Raises:
         ValueError: If the split ratios are invalid.
@@ -78,7 +79,7 @@ def split_dataframe(
         question_ids = {
             "train": set(split_spec["train_question_ids"]),
             "val": set(split_spec["val_question_ids"]),
-            "test": set(split_spec["test_question_ids"]),
+            "test": set(split_spec.get("test_question_ids", [])),
         }
         all_saved_ids = question_ids["train"] | question_ids["val"] | question_ids["test"]
         dataset_ids = set(df["question_id"].tolist())
@@ -97,31 +98,43 @@ def split_dataframe(
             test_df.reset_index(drop=True),
         )
 
-    if val_ratio <= 0 or test_ratio <= 0:
-        raise ValueError("val_ratio and test_ratio must both be greater than 0.")
+    if val_ratio <= 0:
+        raise ValueError("val_ratio must be greater than 0.")
+    if test_ratio < 0:
+        raise ValueError("test_ratio must be greater than or equal to 0.")
     if val_ratio + test_ratio >= 1:
         raise ValueError("val_ratio + test_ratio must be less than 1.")
 
     stratify_labels = df["ans"] if "ans" in df.columns else None
 
-    train_df, temp_df = train_test_split(
-        df,
-        test_size=val_ratio + test_ratio,
-        random_state=random_state,
-        shuffle=True,
-        stratify=stratify_labels,
-    )
+    if test_ratio == 0:
+        train_df, val_df = train_test_split(
+            df,
+            test_size=val_ratio,
+            random_state=random_state,
+            shuffle=True,
+            stratify=stratify_labels,
+        )
+        test_df = df.iloc[0:0].copy()
+    else:
+        train_df, temp_df = train_test_split(
+            df,
+            test_size=val_ratio + test_ratio,
+            random_state=random_state,
+            shuffle=True,
+            stratify=stratify_labels,
+        )
 
-    temp_stratify = temp_df["ans"] if "ans" in temp_df.columns else None
-    relative_test_ratio = test_ratio / (val_ratio + test_ratio)
+        temp_stratify = temp_df["ans"] if "ans" in temp_df.columns else None
+        relative_test_ratio = test_ratio / (val_ratio + test_ratio)
 
-    val_df, test_df = train_test_split(
-        temp_df,
-        test_size=relative_test_ratio,
-        random_state=random_state,
-        shuffle=True,
-        stratify=temp_stratify,
-    )
+        val_df, test_df = train_test_split(
+            temp_df,
+            test_size=relative_test_ratio,
+            random_state=random_state,
+            shuffle=True,
+            stratify=temp_stratify,
+        )
 
     train_df = train_df.reset_index(drop=True)
     val_df = val_df.reset_index(drop=True)

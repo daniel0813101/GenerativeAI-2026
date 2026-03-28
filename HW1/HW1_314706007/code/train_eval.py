@@ -44,11 +44,13 @@ class TrainingConfig:
     use_kfold: bool = False
     num_folds: int = 5
     kfold_split_path: str = "../saved_models/splits/default_kfold_5.json"
-    split_path: str = "../saved_models/splits/default_split.json"
+    use_holdout_test: bool = False
+    split_path: str = "../saved_models/splits/default_holdout_split.json"
+    tuning_split_path: str = "../saved_models/splits/default_train_val_split.json"
     batch_size: int = 8
     eval_batch_size: int = 4
     learning_rate: float = 1e-5
-    num_epochs: int = 50
+    num_epochs: int = 30
     weight_decay: float = 0.02
     warmup_ratio: float = 0.1
     label_smoothing: float = 0.1
@@ -809,7 +811,10 @@ def train_one_split(
 
     metrics = {
         "run_dir": str(run_dir),
+        "selection_metric": "best_val_accuracy",
+        "selection_score": best_accuracy,
         "best_val_accuracy": best_accuracy,
+        "evaluation_mode": "validation_plus_holdout_test" if test_df is not None else "validation_only",
         "train_size": len(train_df),
         "val_size": len(val_df),
     }
@@ -854,6 +859,7 @@ def train_one_split(
         run_dir / "training_state.pt",
     )
     print(f"Saved run outputs to {run_dir}")
+    print(f"Selection metric (best validation accuracy): {metrics['best_val_accuracy']:.4f}")
     if "test_accuracy" in metrics:
         print(f"Final held-out test accuracy: {metrics['test_accuracy']:.4f}")
     return metrics
@@ -893,10 +899,13 @@ def train(config: TrainingConfig) -> None:
                 )
             )
 
+        mean_best_val_accuracy = sum(metric["best_val_accuracy"] for metric in fold_metrics) / max(len(fold_metrics), 1)
         summary = {
             "run_dir": str(run_dir),
+            "selection_metric": "mean_best_val_accuracy",
+            "selection_score": mean_best_val_accuracy,
             "num_folds": config.num_folds,
-            "mean_best_val_accuracy": sum(metric["best_val_accuracy"] for metric in fold_metrics) / max(len(fold_metrics), 1),
+            "mean_best_val_accuracy": mean_best_val_accuracy,
             "fold_metrics": fold_metrics,
         }
         save_json(summary, run_dir / "cv_metrics.json")
@@ -904,13 +913,25 @@ def train(config: TrainingConfig) -> None:
         print(f"Mean best validation accuracy across folds: {summary['mean_best_val_accuracy']:.4f}")
         return
 
-    train_df, val_df, test_df = split_dataframe(
-        full_df,
-        val_ratio=config.val_ratio,
-        test_ratio=config.test_ratio,
-        random_state=config.seed,
-        split_path=config.split_path,
-    )
+    if config.use_holdout_test:
+        train_df, val_df, test_df = split_dataframe(
+            full_df,
+            val_ratio=config.val_ratio,
+            test_ratio=config.test_ratio,
+            random_state=config.seed,
+            split_path=config.split_path,
+        )
+        print("Running train/validation/test workflow. Use best_val_accuracy for model selection; treat held-out test as a final check.")
+    else:
+        train_df, val_df, _ = split_dataframe(
+            full_df,
+            val_ratio=config.val_ratio,
+            test_ratio=0.0,
+            random_state=config.seed,
+            split_path=config.tuning_split_path,
+        )
+        test_df = None
+        print("Running train/validation-only workflow. Use best_val_accuracy as the main model-selection target.")
     train_one_split(
         config=config,
         train_df=train_df,

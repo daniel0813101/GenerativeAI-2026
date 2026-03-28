@@ -16,7 +16,7 @@ def run_inference(
     model_dirs: Sequence[str | Path],
     benchmark_csv: str | Path,
     output_csv: str | Path | None,
-    max_length: int = 512,
+    max_length: int = 1024,
     batch_size: int = 4,
     option_order_ensemble: bool = False,
     num_option_order_permutations: int = 4,
@@ -99,7 +99,7 @@ def parse_args():
     parser.add_argument("--model_dirs", type=str, nargs="+", required=True)
     parser.add_argument("--benchmark_csv", type=str, default="../dataset/benchmark.csv")
     parser.add_argument("--output_csv", type=str, default=None)
-    parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--option_order_ensemble", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--num_option_order_permutations", type=int, default=4)
