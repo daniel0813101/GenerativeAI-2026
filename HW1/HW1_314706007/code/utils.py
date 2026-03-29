@@ -244,7 +244,7 @@ def build_kfold_splits(
 
 
 def build_prompt(row: pd.Series | Dict[str, object]) -> str:
-    """Format one MCQ row into an explanation-first instruction prompt.
+    """Format one MCQ row into a native Llama-3 Instruct prompt.
 
     Args:
         row: A dataset row containing the question and options.
@@ -252,41 +252,40 @@ def build_prompt(row: pd.Series | Dict[str, object]) -> str:
     Returns:
         The prompt string given to the language model.
     """
-    system_persona = (
-        "You are an expert, dual-board-certified pathologist taking a high-stakes "
-        "medical licensing examination. Read the question and the options carefully. "
-        "First, provide a brief, step-by-step medical explanation for your diagnosis. "
-        "Then, you MUST conclude your response with the exact phrase "
-        "'Final Answer: [Option Letter]'.\n\n"
+    # We use a Few-Shot example to show it exactly how to format the text generation
+    system_prompt = (
+        "You are an expert pathologist taking a medical board exam. "
+        "Read the question and output the final answer letter. "
+        "Format your response exactly as shown in the example."
     )
 
-    few_shot_example = (
-        "Question:\n"
-        "A 45-year-old man presents with a painless neck mass. Biopsy reveals large cells "
-        "with multilobated nuclei and prominent nucleoli resembling 'popcorn' cells. "
-        "What is the most likely diagnosis?\n\n"
+    few_shot_user = (
+        "Question:\nBiopsy reveals large cells resembling 'popcorn' cells. Most likely diagnosis?\n\n"
         "Options:\n"
         "A. Nodular lymphocyte predominant Hodgkin lymphoma\n"
         "B. Nodular sclerosis Hodgkin lymphoma\n"
         "C. Burkitt lymphoma\n"
         "D. Follicular lymphoma\n\n"
-        "Explanation: The clinical presentation of a painless neck mass combined with the "
-        "histological finding of 'popcorn' cells is the classic hallmark of Nodular "
-        "lymphocyte predominant Hodgkin lymphoma.\n"
-        "Final Answer: A\n\n"
-        "---\n\n"
+        "Answer:"
     )
+    few_shot_assistant = "The 'popcorn' cells are classic for this disease. Final Answer: A"
 
-    return (
-        f"{system_persona}"
-        f"{few_shot_example}"
+    actual_user = (
         f"Question:\n{row['question']}\n\n"
         "Options:\n"
         f"A. {row['opa']}\n"
         f"B. {row['opb']}\n"
         f"C. {row['opc']}\n"
         f"D. {row['opd']}\n\n"
-        "Explanation:"
+        "Answer:"
+    )
+
+    return (
+        f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+        f"{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"{few_shot_user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        f"{few_shot_assistant}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"{actual_user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     )
 
 
@@ -355,23 +354,6 @@ def get_option_permutations(num_permutations: int = 4) -> List[List[int]]:
     return [list(permutation) for permutation in itertools.islice(itertools.permutations(range(len(OPTION_COLUMNS))), num_permutations)]
 
 
-def restore_permuted_choice_logits(choice_logits: torch.Tensor, permutation: Sequence[int]) -> torch.Tensor:
-    """Map logits from a permuted option order back to the original order.
-
-    Args:
-        choice_logits: Tensor of shape ``(..., 4)`` in permuted option order.
-        permutation: Mapping from new option index to original option index.
-
-    Returns:
-        A tensor with the same shape as ``choice_logits`` in the original
-        ``A/B/C/D`` order.
-    """
-    restored_logits = torch.empty_like(choice_logits)
-    for new_index, old_index in enumerate(permutation):
-        restored_logits[..., old_index] = choice_logits[..., new_index]
-    return restored_logits
-
-
 def label_id_to_text(label_id: int) -> str:
     """Convert an integer class id into an option letter.
 
@@ -397,7 +379,7 @@ def label_text_to_id(label_text: str) -> int:
 
 
 def extract_prediction(text: str) -> int:
-    """Parse generated text for a final answer choice.
+    """Robustly parse generated text for the chosen option letter.
 
     Args:
         text: Raw generated text from the model.
@@ -414,30 +396,6 @@ def extract_prediction(text: str) -> int:
         return LABEL_TO_ID[matches[-1].upper()]
 
     return 0
-
-
-def get_choice_token_ids(tokenizer) -> Dict[str, int]:
-    """Map answer letters to their tokenizer token ids.
-
-    Args:
-        tokenizer: Hugging Face tokenizer used by the baseline model.
-
-    Returns:
-        A mapping from answer letters to token ids.
-
-    Raises:
-        ValueError: If a choice letter does not map to a single token.
-    """
-    token_ids: Dict[str, int] = {}
-    for choice in ("A", "B", "C", "D"):
-        encoded = tokenizer.encode(f" {choice}", add_special_tokens=False)
-        if len(encoded) != 1:
-            raise ValueError(
-                f"Choice {choice} is tokenized into {encoded}. "
-                "This baseline expects each answer letter to map to a single token."
-            )
-        token_ids[choice] = encoded[0]
-    return token_ids
 
 
 def compute_accuracy(predictions: Sequence[int], references: Sequence[int]) -> float:
@@ -590,19 +548,35 @@ class SupervisedCollator:
         Returns:
             A padded ``MCQBatch`` ready for model input.
         """
-        input_ids = pad_sequence(
-            [feature["input_ids"] for feature in features],
-            batch_first=True,
-            padding_value=self.pad_token_id,
+        max_length = max(feature["input_ids"].size(0) for feature in features)
+        input_ids = torch.stack(
+            [
+                torch.nn.functional.pad(
+                    feature["input_ids"],
+                    (max_length - feature["input_ids"].size(0), 0),
+                    value=self.pad_token_id,
+                )
+                for feature in features
+            ]
         )
-        attention_mask = pad_sequence(
-            [feature["attention_mask"] for feature in features],
-            batch_first=True,
-            padding_value=0,
+        attention_mask = torch.stack(
+            [
+                torch.nn.functional.pad(
+                    feature["attention_mask"],
+                    (max_length - feature["attention_mask"].size(0), 0),
+                    value=0,
+                )
+                for feature in features
+            ]
         )
-        labels = pad_sequence(
-            [feature["labels"] for feature in features],
-            batch_first=True,
-            padding_value=-100,
+        labels = torch.stack(
+            [
+                torch.nn.functional.pad(
+                    feature["labels"],
+                    (max_length - feature["labels"].size(0), 0),
+                    value=-100,
+                )
+                for feature in features
+            ]
         )
         return MCQBatch(input_ids=input_ids, attention_mask=attention_mask, labels=labels)

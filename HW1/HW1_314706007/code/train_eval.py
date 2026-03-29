@@ -8,7 +8,6 @@ from typing import Dict, List, Sequence
 
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
@@ -22,12 +21,9 @@ from utils import (
     build_prompt,
     compute_accuracy,
     extract_prediction,
-    get_choice_token_ids,
-    get_option_permutations,
     load_dataset,
     plot_test_results,
     plot_training_history,
-    restore_permuted_choice_logits,
     save_json,
     set_seed,
     permute_answer_options,
@@ -180,7 +176,10 @@ class SupervisedDataset(Dataset):
             row = shuffle_answer_options(row)
 
         prompt = build_prompt(row)
-        answer_text = f" Final Answer: {ID_TO_LABEL[int(row['ans'])]}{self.tokenizer.eos_token}"
+
+        # Match the few-shot training target used during inference prompting.
+        ans_letter = ID_TO_LABEL[int(row["ans"])]
+        answer_text = f"The evidence points to this diagnosis. Final Answer: {ans_letter}<|eot_id|>"
         full_text = prompt + answer_text
         encoded = self.tokenizer(full_text, truncation=True, max_length=self.max_length, return_tensors="pt")
         input_ids = encoded["input_ids"].squeeze(0)
@@ -209,46 +208,32 @@ def prompt_collate_fn(features: List[Dict[str, torch.Tensor]], tokenizer) -> Dic
     Returns:
         A dictionary containing padded tensors and per-item metadata.
     """
-    input_ids = torch.nn.utils.rnn.pad_sequence(
-        [feature["input_ids"] for feature in features],
-        batch_first=True,
-        padding_value=tokenizer.pad_token_id,
+    max_length = max(feature["input_ids"].size(0) for feature in features)
+    input_ids = torch.stack(
+        [
+            torch.nn.functional.pad(
+                feature["input_ids"],
+                (max_length - feature["input_ids"].size(0), 0),
+                value=tokenizer.pad_token_id,
+            )
+            for feature in features
+        ]
     )
-    attention_mask = torch.nn.utils.rnn.pad_sequence(
-        [feature["attention_mask"] for feature in features],
-        batch_first=True,
-        padding_value=0,
+    attention_mask = torch.stack(
+        [
+            torch.nn.functional.pad(
+                feature["attention_mask"],
+                (max_length - feature["attention_mask"].size(0), 0),
+                value=0,
+            )
+            for feature in features
+        ]
     )
     batch = {"input_ids": input_ids, "attention_mask": attention_mask}
     if "target" in features[0]:
         batch["target"] = torch.stack([feature["target"] for feature in features])
     batch["question_id"] = torch.stack([feature["question_id"] for feature in features])
     return batch
-
-
-def compute_choice_logits(
-    model,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    candidate_ids: torch.Tensor,
-) -> torch.Tensor:
-    """Compute logits over answer choices for the next token position.
-
-    Args:
-        model: Causal language model being trained or evaluated.
-        input_ids: Prompt token ids with shape ``(batch_size, seq_len)``.
-        attention_mask: Attention mask with shape ``(batch_size, seq_len)``.
-        candidate_ids: Token ids for the answer choices ``A/B/C/D``.
-
-    Returns:
-        A tensor of shape ``(batch_size, 4)`` containing logits for the
-        answer choices only.
-    """
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-    last_indices = attention_mask.sum(dim=1) - 1
-    batch_indices = torch.arange(input_ids.size(0), device=input_ids.device)
-    next_token_logits = outputs.logits[batch_indices, last_indices]
-    return next_token_logits.index_select(dim=-1, index=candidate_ids)
 
 
 def create_prompt_dataloader(
@@ -291,261 +276,6 @@ def create_prompt_dataloader(
     )
 
 
-def collect_choice_logits_from_dataloader(
-    model,
-    dataloader: DataLoader,
-    tokenizer,
-    device: torch.device,
-) -> tuple[torch.Tensor, List[int], List[int] | None]:
-    """Collect per-example answer-choice logits from a prompt dataloader.
-
-    Args:
-        model: Causal language model used for scoring.
-        dataloader: Dataloader yielding prompt-only batches.
-        tokenizer: Tokenizer used to map answer letters to token ids.
-        device: Device used for inference.
-
-    Returns:
-        A tuple containing stacked choice logits, question ids, and optional
-        target labels.
-    """
-    model.eval()
-    choice_token_ids = get_choice_token_ids(tokenizer)
-    candidate_ids = torch.tensor([choice_token_ids["A"], choice_token_ids["B"], choice_token_ids["C"], choice_token_ids["D"]], device=device)
-    use_amp = device.type == "cuda"
-    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
-    logits_batches = []
-    question_ids: List[int] = []
-    targets: List[int] = []
-    has_targets = False
-
-    with torch.no_grad():
-        for batch in dataloader:
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                choice_logits = compute_choice_logits(model, input_ids, attention_mask, candidate_ids)
-            logits_batches.append(choice_logits.detach().cpu())
-            question_ids.extend(batch["question_id"].tolist())
-            if "target" in batch:
-                has_targets = True
-                targets.extend(batch["target"].tolist())
-
-    return torch.cat(logits_batches, dim=0), question_ids, targets if has_targets else None
-
-
-def collect_choice_logits_from_dataframe(
-    model,
-    dataframe: pd.DataFrame,
-    tokenizer,
-    device: torch.device,
-    max_length: int,
-    batch_size: int,
-    num_workers: int,
-    pin_memory: bool,
-    option_order_ensemble: bool = False,
-    num_option_order_permutations: int = 4,
-) -> tuple[torch.Tensor, List[int], List[int] | None]:
-    """Collect answer-choice logits, optionally averaged over option permutations.
-
-    Args:
-        model: Causal language model used for scoring.
-        dataframe: Dataframe containing evaluation examples.
-        tokenizer: Tokenizer used to encode prompts.
-        device: Device used for inference.
-        max_length: Maximum prompt length.
-        batch_size: Number of examples per batch.
-        num_workers: Number of dataloader worker processes.
-        pin_memory: Whether to pin CPU memory for faster host-to-device copies.
-        option_order_ensemble: Whether to average logits across multiple option
-            order permutations.
-        num_option_order_permutations: Number of permutations to evaluate when
-            ensembling is enabled.
-
-    Returns:
-        A tuple containing ensembled logits, question ids, and optional target
-        labels.
-    """
-    num_permutations = num_option_order_permutations if option_order_ensemble else 1
-    permutations = get_option_permutations(num_permutations)
-    ensemble_logits = None
-    question_ids: List[int] | None = None
-    targets: List[int] | None = None
-
-    for permutation in permutations:
-        dataloader = create_prompt_dataloader(
-            dataframe,
-            tokenizer,
-            max_length=max_length,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            option_permutation=permutation,
-        )
-        permutation_logits, batch_question_ids, batch_targets = collect_choice_logits_from_dataloader(
-            model,
-            dataloader,
-            tokenizer,
-            device,
-        )
-        restored_logits = restore_permuted_choice_logits(permutation_logits, permutation)
-
-        if ensemble_logits is None:
-            ensemble_logits = restored_logits
-            question_ids = batch_question_ids
-            targets = batch_targets
-        else:
-            if batch_question_ids != question_ids:
-                raise ValueError("Option-order ensemble produced a different question ordering.")
-            ensemble_logits += restored_logits
-
-    return ensemble_logits / len(permutations), question_ids or [], targets
-
-
-def evaluate_choice_loss_from_dataframe(
-    model,
-    dataframe: pd.DataFrame,
-    tokenizer,
-    device: torch.device,
-    max_length: int,
-    batch_size: int,
-    num_workers: int,
-    pin_memory: bool,
-    option_order_ensemble: bool = False,
-    num_option_order_permutations: int = 4,
-) -> float:
-    """Compute choice loss from a dataframe.
-
-    Args:
-        model: Causal language model used for scoring.
-        dataframe: Labeled evaluation examples.
-        tokenizer: Tokenizer used to encode prompts.
-        device: Device used for inference.
-        max_length: Maximum prompt length.
-        batch_size: Number of examples per batch.
-        num_workers: Number of dataloader worker processes.
-        pin_memory: Whether to pin CPU memory for faster host-to-device copies.
-        option_order_ensemble: Whether to average logits across multiple option
-            order permutations.
-        num_option_order_permutations: Number of permutations to evaluate when
-            ensembling is enabled.
-
-        Returns:
-            Mean cross-entropy loss over answer choices.
-    """
-    choice_logits, _, targets = collect_choice_logits_from_dataframe(
-        model,
-        dataframe,
-        tokenizer,
-        device,
-        max_length=max_length,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        option_order_ensemble=option_order_ensemble,
-        num_option_order_permutations=num_option_order_permutations,
-    )
-    if targets is None:
-        raise ValueError("Choice loss requires labeled examples.")
-    return F.cross_entropy(choice_logits, torch.tensor(targets, dtype=torch.long)).item()
-
-
-def collect_predictions_from_dataframe(
-    model,
-    dataframe: pd.DataFrame,
-    tokenizer,
-    device: torch.device,
-    max_length: int,
-    batch_size: int,
-    num_workers: int,
-    pin_memory: bool,
-    option_order_ensemble: bool = False,
-    num_option_order_permutations: int = 4,
-) -> pd.DataFrame:
-    """Collect predictions from a dataframe.
-
-    Args:
-        model: Causal language model used for scoring.
-        dataframe: Dataframe containing evaluation examples.
-        tokenizer: Tokenizer used to encode prompts.
-        device: Device used for inference.
-        max_length: Maximum prompt length.
-        batch_size: Number of examples per batch.
-        num_workers: Number of dataloader worker processes.
-        pin_memory: Whether to pin CPU memory for faster host-to-device copies.
-        option_order_ensemble: Whether to average logits across multiple option
-            order permutations.
-        num_option_order_permutations: Number of permutations to evaluate when
-            ensembling is enabled.
-
-    Returns:
-        A DataFrame containing question ids, predictions, and optional labels.
-    """
-    choice_logits, question_ids, targets = collect_choice_logits_from_dataframe(
-        model,
-        dataframe,
-        tokenizer,
-        device,
-        max_length=max_length,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        option_order_ensemble=option_order_ensemble,
-        num_option_order_permutations=num_option_order_permutations,
-    )
-    predictions = choice_logits.argmax(dim=-1).tolist()
-    rows = []
-    target_values = targets if targets is not None else [None] * len(predictions)
-    for question_id, prediction, target in zip(question_ids, predictions, target_values):
-        row = {"question_id": question_id, "prediction": prediction}
-        if target is not None:
-            row["target"] = target
-            row["correct"] = int(prediction == target)
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def evaluate_choice_loss(
-    model,
-    dataloader: DataLoader,
-    tokenizer,
-    device: torch.device,
-) -> float:
-    """Compute choice-only validation loss over A/B/C/D logits.
-
-    Args:
-        model: Causal language model under evaluation.
-        dataloader: Dataloader yielding prompt-only labeled batches.
-        tokenizer: Tokenizer used to identify answer token ids.
-        device: Device used for evaluation.
-
-    Returns:
-        Mean cross-entropy loss over the four answer choices.
-    """
-    model.eval()
-    running_loss = 0.0
-    batch_count = 0
-    choice_token_ids = get_choice_token_ids(tokenizer)
-    candidate_ids = torch.tensor(
-        [choice_token_ids["A"], choice_token_ids["B"], choice_token_ids["C"], choice_token_ids["D"]],
-        device=device,
-    )
-    use_amp = device.type == "cuda"
-    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
-
-    with torch.no_grad():
-        for batch in dataloader:
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            targets = batch["target"].to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                choice_logits = compute_choice_logits(model, input_ids, attention_mask, candidate_ids)
-            running_loss += F.cross_entropy(choice_logits, targets).item()
-            batch_count += 1
-
-    return running_loss / max(batch_count, 1)
-
-
 def evaluate_supervised_loss(
     model,
     dataloader: DataLoader,
@@ -578,115 +308,6 @@ def evaluate_supervised_loss(
             batch_count += 1
 
     return running_loss / max(batch_count, 1)
-
-
-def predict_choice_ids(
-    model,
-    dataloader: DataLoader,
-    tokenizer,
-    device: torch.device,
-) -> List[int]:
-    """Predict answer class ids from prompt-only batches.
-
-    Args:
-        model: Trained causal language model.
-        dataloader: Dataloader yielding prompt-only batches.
-        tokenizer: Tokenizer used to identify answer token ids.
-        device: Device used for inference.
-
-    Returns:
-        Predicted class ids for all examples in order.
-    """
-    model.eval()
-    choice_token_ids = get_choice_token_ids(tokenizer)
-    candidate_ids = torch.tensor([choice_token_ids["A"], choice_token_ids["B"], choice_token_ids["C"], choice_token_ids["D"]], device=device)
-    predictions: List[int] = []
-    use_amp = device.type == "cuda"
-    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
-
-    with torch.no_grad():
-        for batch in dataloader:
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                choice_logits = compute_choice_logits(model, input_ids, attention_mask, candidate_ids)
-            batch_predictions = choice_logits.argmax(dim=-1).detach().cpu().tolist()
-            predictions.extend(batch_predictions)
-
-    return predictions
-
-
-def evaluate_accuracy(
-    model,
-    dataloader: DataLoader,
-    tokenizer,
-    device: torch.device,
-) -> float:
-    """Compute classification accuracy from prompt-only evaluation batches.
-
-    Args:
-        model: Trained causal language model.
-        dataloader: Dataloader yielding prompt-only labeled batches.
-        tokenizer: Tokenizer used to identify answer token ids.
-        device: Device used for inference.
-
-    Returns:
-        Accuracy on the provided dataloader.
-    """
-    predictions_df = collect_predictions(model, dataloader, tokenizer, device)
-    return compute_accuracy(
-        predictions_df["prediction"].tolist(),
-        predictions_df["target"].tolist(),
-    )
-
-
-def collect_predictions(
-    model,
-    dataloader: DataLoader,
-    tokenizer,
-    device: torch.device,
-) -> pd.DataFrame:
-    """Collect per-example predictions into a DataFrame.
-
-    Args:
-        model: Trained causal language model.
-        dataloader: Dataloader yielding prompt-only batches.
-        tokenizer: Tokenizer used to identify answer token ids.
-        device: Device used for inference.
-
-    Returns:
-        A DataFrame with question ids, predictions, and optional targets.
-    """
-    model.eval()
-    choice_token_ids = get_choice_token_ids(tokenizer)
-    candidate_ids = torch.tensor([choice_token_ids["A"], choice_token_ids["B"], choice_token_ids["C"], choice_token_ids["D"]], device=device)
-    use_amp = device.type == "cuda"
-    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
-    rows = []
-
-    with torch.no_grad():
-        for batch in dataloader:
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                choice_logits = compute_choice_logits(model, input_ids, attention_mask, candidate_ids)
-            batch_predictions = choice_logits.argmax(dim=-1).detach().cpu().tolist()
-
-            targets = batch["target"].tolist() if "target" in batch else [None] * len(batch_predictions)
-            for question_id, prediction, target in zip(
-                batch["question_id"].tolist(),
-                batch_predictions,
-                targets,
-            ):
-                row = {
-                    "question_id": question_id,
-                    "prediction": prediction,
-                }
-                if target is not None:
-                    row["target"] = target
-                    row["correct"] = int(prediction == target)
-                rows.append(row)
-    return pd.DataFrame(rows)
 
 
 def collect_generated_predictions(
@@ -792,6 +413,19 @@ def save_checkpoint(model, tokenizer, output_dir: str | Path, config: TrainingCo
     save_json({"history": history}, output_dir / "history.json")
 
 
+def configure_greedy_generation(model) -> None:
+    """Normalize generation config for greedy decoding without sampling warnings.
+
+    Args:
+        model: Causal language model whose generation config should be updated.
+    """
+    if getattr(model, "generation_config", None) is None:
+        return
+    model.generation_config.do_sample = False
+    model.generation_config.temperature = 1.0
+    model.generation_config.top_p = 1.0
+
+
 def create_model(config: TrainingConfig, tokenizer, device: torch.device):
     """Load a base language model and optionally attach LoRA adapters.
 
@@ -824,6 +458,7 @@ def create_model(config: TrainingConfig, tokenizer, device: torch.device):
         model.print_trainable_parameters()
 
     model.to(device)
+    configure_greedy_generation(model)
     return model
 
 
@@ -854,6 +489,7 @@ def load_saved_model(model_dir: str | Path, tokenizer, device: torch.device):
 
     model.config.pad_token_id = tokenizer.pad_token_id
     model.to(device)
+    configure_greedy_generation(model)
     return model
 
 
@@ -898,6 +534,7 @@ def train_one_split(
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     model = create_model(config, tokenizer, device)
     pin_memory = device.type == "cuda"

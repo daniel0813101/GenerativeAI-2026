@@ -71,7 +71,7 @@ def generate_predictions_from_dataframe(
                 generated_ids = model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    max_new_tokens=100,
+                    max_new_tokens=25,  # Allows short text, prevents long rambling
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                     do_sample=False,
@@ -133,6 +133,7 @@ def run_inference(
     tokenizer = AutoTokenizer.from_pretrained(model_dirs[0])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     benchmark_df = load_dataset(benchmark_csv)
     all_model_predictions = []
