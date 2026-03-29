@@ -1,0 +1,9 @@
+{
+  "run_dir": "../saved_models/checkpoint/20260328-150758",
+  "selection_metric": "best_val_accuracy",
+  "selection_score": 0.76,
+  "best_val_accuracy": 0.76,
+  "evaluation_mode": "validation_only",
+  "train_size": 8100,
+  "val_size": 900
+}
