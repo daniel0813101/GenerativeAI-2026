@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import json
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence
@@ -243,7 +244,7 @@ def build_kfold_splits(
 
 
 def build_prompt(row: pd.Series | Dict[str, object]) -> str:
-    """Format one MCQ row into an optimized two-shot instruction prompt.
+    """Format one MCQ row into an explanation-first instruction prompt.
 
     Args:
         row: A dataset row containing the question and options.
@@ -252,14 +253,14 @@ def build_prompt(row: pd.Series | Dict[str, object]) -> str:
         The prompt string given to the language model.
     """
     system_persona = (
-        "You are an expert, dual-board-certified anatomical and clinical pathologist "
-        "taking a high-stakes medical licensing examination. Your task is to critically evaluate "
-        "the patient's clinical presentation, histopathological findings, and molecular markers "
-        "to determine the single best answer. You must synthesize complex medical data with "
-        "absolute clinical precision. Output strictly the letter of the correct option (A, B, C, or D).\n\n"
+        "You are an expert, dual-board-certified pathologist taking a high-stakes "
+        "medical licensing examination. Read the question and the options carefully. "
+        "First, provide a brief, step-by-step medical explanation for your diagnosis. "
+        "Then, you MUST conclude your response with the exact phrase "
+        "'Final Answer: [Option Letter]'.\n\n"
     )
 
-    few_shot_examples = (
+    few_shot_example = (
         "Question:\n"
         "A 45-year-old man presents with a painless neck mass. Biopsy reveals large cells "
         "with multilobated nuclei and prominent nucleoli resembling 'popcorn' cells. "
@@ -269,32 +270,23 @@ def build_prompt(row: pd.Series | Dict[str, object]) -> str:
         "B. Nodular sclerosis Hodgkin lymphoma\n"
         "C. Burkitt lymphoma\n"
         "D. Follicular lymphoma\n\n"
-        "Answer: A\n\n"
-        "---\n\n"
-        "Question:\n"
-        "A 32-year-old woman undergoes a routine cervical cytology screen. The pathologist notes "
-        "scattered squamous epithelial cells characterized by enlarged, hyperchromatic nuclei with "
-        "irregular contours, surrounded by a distinct, clear perinuclear halo. Which of the following "
-        "is the most likely cause of these specific cellular changes?\n\n"
-        "Options:\n"
-        "A. Candida albicans infection\n"
-        "B. Trichomonas vaginalis infection\n"
-        "C. Herpes simplex virus (HSV) infection\n"
-        "D. Human papillomavirus (HPV) infection\n\n"
-        "Answer: D\n\n"
+        "Explanation: The clinical presentation of a painless neck mass combined with the "
+        "histological finding of 'popcorn' cells is the classic hallmark of Nodular "
+        "lymphocyte predominant Hodgkin lymphoma.\n"
+        "Final Answer: A\n\n"
         "---\n\n"
     )
 
     return (
         f"{system_persona}"
-        f"{few_shot_examples}"
+        f"{few_shot_example}"
         f"Question:\n{row['question']}\n\n"
         "Options:\n"
         f"A. {row['opa']}\n"
         f"B. {row['opb']}\n"
         f"C. {row['opc']}\n"
         f"D. {row['opd']}\n\n"
-        "Answer:"
+        "Explanation:"
     )
 
 
@@ -405,22 +397,23 @@ def label_text_to_id(label_text: str) -> int:
 
 
 def extract_prediction(text: str) -> int:
-    """Parse the first valid answer choice from model text output.
+    """Parse generated text for a final answer choice.
 
     Args:
         text: Raw generated text from the model.
 
     Returns:
         The predicted class id.
-
-    Raises:
-        ValueError: If no valid answer choice can be parsed.
     """
-    normalized = text.strip().upper()
-    for choice in ("A", "B", "C", "D"):
-        if normalized.startswith(choice):
-            return LABEL_TO_ID[choice]
-    raise ValueError(f"Unable to parse prediction from text: {text!r}")
+    match = re.search(r"Final Answer:\s*([A-D])", text, re.IGNORECASE)
+    if match:
+        return LABEL_TO_ID[match.group(1).upper()]
+
+    matches = re.findall(r"\b([A-D])\b", text, re.IGNORECASE)
+    if matches:
+        return LABEL_TO_ID[matches[-1].upper()]
+
+    return 0
 
 
 def get_choice_token_ids(tokenizer) -> Dict[str, int]:

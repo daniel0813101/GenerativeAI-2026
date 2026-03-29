@@ -16,9 +16,12 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 
 from utils import (
+    ID_TO_LABEL,
+    SupervisedCollator,
     build_kfold_splits,
     build_prompt,
     compute_accuracy,
+    extract_prediction,
     get_choice_token_ids,
     get_option_permutations,
     load_dataset,
@@ -138,6 +141,64 @@ class PromptOnlyDataset(Dataset):
         return self._build_example(index)
 
 
+class SupervisedDataset(Dataset):
+    def __init__(self, dataframe: pd.DataFrame, tokenizer, max_length: int, shuffle_options: bool = False):
+        """Build supervised causal-LM examples for fine-tuning.
+
+        Args:
+            dataframe: Labeled MCQ samples used for training or validation.
+            tokenizer: Tokenizer used to encode prompts and answers.
+            max_length: Maximum combined prompt-answer sequence length.
+            shuffle_options: Whether to randomly shuffle answer options for
+                augmentation before prompt construction.
+        """
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.shuffle_options = shuffle_options
+
+    def __len__(self) -> int:
+        """Return the number of rows in the dataset.
+
+        Returns:
+            The dataset size.
+        """
+        return len(self.dataframe)
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        """Create one supervised example with labels masked over the prompt.
+
+        Args:
+            index: Dataset row index.
+
+        Returns:
+            A dictionary containing ``input_ids``, ``attention_mask``, and
+            ``labels`` for causal language-model training.
+        """
+        row = self.dataframe.iloc[index]
+        if self.shuffle_options:
+            row = shuffle_answer_options(row)
+
+        prompt = build_prompt(row)
+        answer_text = f" Final Answer: {ID_TO_LABEL[int(row['ans'])]}{self.tokenizer.eos_token}"
+        full_text = prompt + answer_text
+        encoded = self.tokenizer(full_text, truncation=True, max_length=self.max_length, return_tensors="pt")
+        input_ids = encoded["input_ids"].squeeze(0)
+        attention_mask = encoded["attention_mask"].squeeze(0)
+
+        prompt_encoded = self.tokenizer(prompt, truncation=True, max_length=self.max_length, return_tensors="pt")
+        prompt_len = prompt_encoded["input_ids"].shape[1]
+
+        labels = input_ids.clone()
+        labels[:prompt_len] = -100
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+
 def prompt_collate_fn(features: List[Dict[str, torch.Tensor]], tokenizer) -> Dict[str, torch.Tensor]:
     """Pad prompt-only examples into a batch.
 
@@ -199,7 +260,21 @@ def create_prompt_dataloader(
     pin_memory: bool,
     option_permutation: Sequence[int] | None = None,
 ) -> DataLoader:
-    """Create a prompt-only dataloader, optionally with deterministic option order."""
+    """Create a prompt-only dataloader.
+
+    Args:
+        dataframe: Dataframe containing MCQ rows to tokenize.
+        tokenizer: Tokenizer used to encode prompts.
+        max_length: Maximum prompt length.
+        batch_size: Number of examples per batch.
+        num_workers: Number of dataloader worker processes.
+        pin_memory: Whether to pin CPU memory for faster host-to-device copies.
+        option_permutation: Optional deterministic option permutation applied
+            to every row before tokenization.
+
+    Returns:
+        A dataloader yielding prompt-only batches.
+    """
     dataset = PromptOnlyDataset(
         dataframe,
         tokenizer,
@@ -222,7 +297,18 @@ def collect_choice_logits_from_dataloader(
     tokenizer,
     device: torch.device,
 ) -> tuple[torch.Tensor, List[int], List[int] | None]:
-    """Collect per-example answer-choice logits from a prompt dataloader."""
+    """Collect per-example answer-choice logits from a prompt dataloader.
+
+    Args:
+        model: Causal language model used for scoring.
+        dataloader: Dataloader yielding prompt-only batches.
+        tokenizer: Tokenizer used to map answer letters to token ids.
+        device: Device used for inference.
+
+    Returns:
+        A tuple containing stacked choice logits, question ids, and optional
+        target labels.
+    """
     model.eval()
     choice_token_ids = get_choice_token_ids(tokenizer)
     candidate_ids = torch.tensor([choice_token_ids["A"], choice_token_ids["B"], choice_token_ids["C"], choice_token_ids["D"]], device=device)
@@ -260,7 +346,26 @@ def collect_choice_logits_from_dataframe(
     option_order_ensemble: bool = False,
     num_option_order_permutations: int = 4,
 ) -> tuple[torch.Tensor, List[int], List[int] | None]:
-    """Collect answer-choice logits, optionally averaged over option permutations."""
+    """Collect answer-choice logits, optionally averaged over option permutations.
+
+    Args:
+        model: Causal language model used for scoring.
+        dataframe: Dataframe containing evaluation examples.
+        tokenizer: Tokenizer used to encode prompts.
+        device: Device used for inference.
+        max_length: Maximum prompt length.
+        batch_size: Number of examples per batch.
+        num_workers: Number of dataloader worker processes.
+        pin_memory: Whether to pin CPU memory for faster host-to-device copies.
+        option_order_ensemble: Whether to average logits across multiple option
+            order permutations.
+        num_option_order_permutations: Number of permutations to evaluate when
+            ensembling is enabled.
+
+    Returns:
+        A tuple containing ensembled logits, question ids, and optional target
+        labels.
+    """
     num_permutations = num_option_order_permutations if option_order_ensemble else 1
     permutations = get_option_permutations(num_permutations)
     ensemble_logits = None
@@ -309,7 +414,25 @@ def evaluate_choice_loss_from_dataframe(
     option_order_ensemble: bool = False,
     num_option_order_permutations: int = 4,
 ) -> float:
-    """Compute choice loss from a dataframe, optionally with option-order ensembling."""
+    """Compute choice loss from a dataframe.
+
+    Args:
+        model: Causal language model used for scoring.
+        dataframe: Labeled evaluation examples.
+        tokenizer: Tokenizer used to encode prompts.
+        device: Device used for inference.
+        max_length: Maximum prompt length.
+        batch_size: Number of examples per batch.
+        num_workers: Number of dataloader worker processes.
+        pin_memory: Whether to pin CPU memory for faster host-to-device copies.
+        option_order_ensemble: Whether to average logits across multiple option
+            order permutations.
+        num_option_order_permutations: Number of permutations to evaluate when
+            ensembling is enabled.
+
+        Returns:
+            Mean cross-entropy loss over answer choices.
+    """
     choice_logits, _, targets = collect_choice_logits_from_dataframe(
         model,
         dataframe,
@@ -339,7 +462,25 @@ def collect_predictions_from_dataframe(
     option_order_ensemble: bool = False,
     num_option_order_permutations: int = 4,
 ) -> pd.DataFrame:
-    """Collect predictions from a dataframe, optionally averaged over option order."""
+    """Collect predictions from a dataframe.
+
+    Args:
+        model: Causal language model used for scoring.
+        dataframe: Dataframe containing evaluation examples.
+        tokenizer: Tokenizer used to encode prompts.
+        device: Device used for inference.
+        max_length: Maximum prompt length.
+        batch_size: Number of examples per batch.
+        num_workers: Number of dataloader worker processes.
+        pin_memory: Whether to pin CPU memory for faster host-to-device copies.
+        option_order_ensemble: Whether to average logits across multiple option
+            order permutations.
+        num_option_order_permutations: Number of permutations to evaluate when
+            ensembling is enabled.
+
+    Returns:
+        A DataFrame containing question ids, predictions, and optional labels.
+    """
     choice_logits, question_ids, targets = collect_choice_logits_from_dataframe(
         model,
         dataframe,
@@ -400,6 +541,40 @@ def evaluate_choice_loss(
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 choice_logits = compute_choice_logits(model, input_ids, attention_mask, candidate_ids)
             running_loss += F.cross_entropy(choice_logits, targets).item()
+            batch_count += 1
+
+    return running_loss / max(batch_count, 1)
+
+
+def evaluate_supervised_loss(
+    model,
+    dataloader: DataLoader,
+    device: torch.device,
+) -> float:
+    """Compute average causal-LM loss over supervised labels.
+
+    Args:
+        model: Causal language model under evaluation.
+        dataloader: Dataloader yielding supervised training-style batches.
+        device: Device used for evaluation.
+
+    Returns:
+        Mean supervised loss across all batches.
+    """
+    model.eval()
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
+    running_loss = 0.0
+    batch_count = 0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch.input_ids.to(device, non_blocking=True)
+            attention_mask = batch.attention_mask.to(device, non_blocking=True)
+            labels = batch.labels.to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            running_loss += outputs.loss.item()
             batch_count += 1
 
     return running_loss / max(batch_count, 1)
@@ -512,6 +687,89 @@ def collect_predictions(
                     row["correct"] = int(prediction == target)
                 rows.append(row)
     return pd.DataFrame(rows)
+
+
+def collect_generated_predictions(
+    model,
+    dataloader: DataLoader,
+    tokenizer,
+    device: torch.device,
+) -> pd.DataFrame:
+    """Generate responses and extract final answer predictions into a DataFrame.
+
+    Args:
+        model: Causal language model used for generation.
+        dataloader: Dataloader yielding prompt-only evaluation batches.
+        tokenizer: Tokenizer used to decode generated tokens.
+        device: Device used for inference.
+
+    Returns:
+        A DataFrame containing question ids, parsed predictions, generated
+        text, and optional labels.
+    """
+    model.eval()
+    rows = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            generated_ids = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=100,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                do_sample=False,
+            )
+            input_lengths = attention_mask.sum(dim=1).tolist()
+            generated_texts = [
+                tokenizer.decode(output_ids[int(input_length):], skip_special_tokens=True)
+                for output_ids, input_length in zip(generated_ids, input_lengths)
+            ]
+
+            targets = batch["target"].tolist() if "target" in batch else [None] * len(generated_texts)
+            for question_id, text, target in zip(
+                batch["question_id"].tolist(),
+                generated_texts,
+                targets,
+            ):
+                prediction = extract_prediction(text)
+                row = {
+                    "question_id": question_id,
+                    "prediction": prediction,
+                    "generated_text": text,
+                }
+                if target is not None:
+                    row["target"] = target
+                    row["correct"] = int(prediction == target)
+                rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def evaluate_generation_accuracy(
+    model,
+    dataloader: DataLoader,
+    tokenizer,
+    device: torch.device,
+) -> float:
+    """Compute accuracy from generated explanations and final answers.
+
+    Args:
+        model: Causal language model used for generation.
+        dataloader: Dataloader yielding prompt-only labeled batches.
+        tokenizer: Tokenizer used to decode generated tokens.
+        device: Device used for inference.
+
+    Returns:
+        Accuracy computed from parsed generated answers.
+    """
+    predictions_df = collect_generated_predictions(model, dataloader, tokenizer, device)
+    return compute_accuracy(
+        predictions_df["prediction"].tolist(),
+        predictions_df["target"].tolist(),
+    )
 
 
 def save_checkpoint(model, tokenizer, output_dir: str | Path, config: TrainingConfig, history: List[Dict[str, float]]) -> None:
@@ -644,12 +902,13 @@ def train_one_split(
     model = create_model(config, tokenizer, device)
     pin_memory = device.type == "cuda"
 
-    train_prompt_dataset = PromptOnlyDataset(
+    train_dataset = SupervisedDataset(
         train_df,
         tokenizer,
         config.max_length,
         shuffle_options=config.shuffle_option_augmentation,
     )
+    val_supervised_dataset = SupervisedDataset(val_df, tokenizer, config.max_length)
     val_prompt_dataset = PromptOnlyDataset(val_df, tokenizer, config.max_length)
     test_prompt_dataset = (
         PromptOnlyDataset(test_df, tokenizer, config.max_length)
@@ -658,12 +917,20 @@ def train_one_split(
     )
 
     train_loader = DataLoader(
-        train_prompt_dataset,
+        train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=pin_memory,
-        collate_fn=lambda batch: prompt_collate_fn(batch, tokenizer),
+        collate_fn=SupervisedCollator(tokenizer),
+    )
+    val_supervised_loader = DataLoader(
+        val_supervised_dataset,
+        batch_size=config.eval_batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=pin_memory,
+        collate_fn=SupervisedCollator(tokenizer),
     )
     val_prompt_loader = DataLoader(
         val_prompt_dataset,
@@ -698,11 +965,6 @@ def train_one_split(
     use_amp = device.type == "cuda"
     amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
-    choice_token_ids = get_choice_token_ids(tokenizer)
-    candidate_ids = torch.tensor(
-        [choice_token_ids["A"], choice_token_ids["B"], choice_token_ids["C"], choice_token_ids["D"]],
-        device=device,
-    )
     history: List[Dict[str, float]] = []
     best_accuracy = -1.0
     epochs_without_improvement = 0
@@ -714,24 +976,19 @@ def train_one_split(
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.num_epochs}", leave=False)
 
         for step, batch in enumerate(progress_bar, start=1):
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            targets = batch["target"].to(device, non_blocking=True)
+            input_ids = batch.input_ids.to(device, non_blocking=True)
+            attention_mask = batch.attention_mask.to(device, non_blocking=True)
+            labels = batch.labels.to(device, non_blocking=True)
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                choice_logits = compute_choice_logits(model, input_ids, attention_mask, candidate_ids)
-                batch_loss = F.cross_entropy(
-                    choice_logits,
-                    targets,
-                    label_smoothing=config.label_smoothing,
-                )
-                loss = batch_loss / config.grad_accum_steps
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs.loss / config.grad_accum_steps
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            running_loss += batch_loss.item()
+            running_loss += loss.item() * config.grad_accum_steps
 
             if step % config.grad_accum_steps == 0 or step == len(train_loader):
                 if scaler.is_enabled():
@@ -745,38 +1002,8 @@ def train_one_split(
             progress_bar.set_postfix(loss=f"{running_loss / step:.4f}")
 
         train_loss = running_loss / max(len(train_loader), 1)
-        if config.option_order_ensemble:
-            val_loss = evaluate_choice_loss_from_dataframe(
-                model,
-                val_df,
-                tokenizer,
-                device,
-                max_length=config.max_length,
-                batch_size=config.eval_batch_size,
-                num_workers=config.num_workers,
-                pin_memory=pin_memory,
-                option_order_ensemble=True,
-                num_option_order_permutations=config.num_option_order_permutations,
-            )
-            val_predictions_df = collect_predictions_from_dataframe(
-                model,
-                val_df,
-                tokenizer,
-                device,
-                max_length=config.max_length,
-                batch_size=config.eval_batch_size,
-                num_workers=config.num_workers,
-                pin_memory=pin_memory,
-                option_order_ensemble=True,
-                num_option_order_permutations=config.num_option_order_permutations,
-            )
-            val_accuracy = compute_accuracy(
-                val_predictions_df["prediction"].tolist(),
-                val_predictions_df["target"].tolist(),
-            )
-        else:
-            val_loss = evaluate_choice_loss(model, val_prompt_loader, tokenizer, device)
-            val_accuracy = evaluate_accuracy(model, val_prompt_loader, tokenizer, device)
+        val_loss = evaluate_supervised_loss(model, val_supervised_loader, device)
+        val_accuracy = evaluate_generation_accuracy(model, val_prompt_loader, tokenizer, device)
 
         epoch_log = {
             "epoch": epoch,
@@ -819,21 +1046,7 @@ def train_one_split(
         "val_size": len(val_df),
     }
     if test_prompt_loader is not None and test_df is not None:
-        if config.option_order_ensemble:
-            test_predictions_df = collect_predictions_from_dataframe(
-                best_model,
-                test_df,
-                tokenizer,
-                device,
-                max_length=config.max_length,
-                batch_size=config.eval_batch_size,
-                num_workers=config.num_workers,
-                pin_memory=pin_memory,
-                option_order_ensemble=True,
-                num_option_order_permutations=config.num_option_order_permutations,
-            )
-        else:
-            test_predictions_df = collect_predictions(best_model, test_prompt_loader, tokenizer, device)
+        test_predictions_df = collect_generated_predictions(best_model, test_prompt_loader, tokenizer, device)
         test_accuracy = compute_accuracy(
             test_predictions_df["prediction"].tolist(),
             test_predictions_df["target"].tolist(),
