@@ -244,23 +244,25 @@ def build_kfold_splits(
 
 
 def build_prompt(row: pd.Series | Dict[str, object]) -> str:
-    """Format one MCQ row into a native Llama-3 Instruct prompt.
+    """Format one MCQ row into a two-shot Llama-3 instruct prompt.
 
     Args:
-        row: A dataset row containing the question and options.
+        row: Dataset row containing the question text and four answer options.
 
     Returns:
-        The prompt string given to the language model.
+        A chat-formatted prompt string ending at the assistant turn, ready for
+        supervised training or generation.
     """
-    # We use a Few-Shot example to show it exactly how to format the text generation
     system_prompt = (
-        "You are an expert pathologist taking a medical board exam. "
-        "Read the question and output the final answer letter. "
-        "Format your response exactly as shown in the example."
+        "You are an expert, board-certified pathologist taking a high-stakes medical licensing exam. "
+        "Analyze the clinical and histological findings to identify the correct diagnosis. "
+        "Briefly state the key reasoning, then strictly output the final answer letter. "
+        "Format your response exactly as shown in the examples."
     )
 
-    few_shot_user = (
-        "Question:\nBiopsy reveals large cells resembling 'popcorn' cells. Most likely diagnosis?\n\n"
+    few_shot_user_1 = (
+        "Question:\nA 45-year-old man presents with a painless neck mass. Biopsy reveals large cells "
+        "with multilobated nuclei and prominent nucleoli resembling 'popcorn' cells. What is the most likely diagnosis?\n\n"
         "Options:\n"
         "A. Nodular lymphocyte predominant Hodgkin lymphoma\n"
         "B. Nodular sclerosis Hodgkin lymphoma\n"
@@ -268,7 +270,26 @@ def build_prompt(row: pd.Series | Dict[str, object]) -> str:
         "D. Follicular lymphoma\n\n"
         "Answer:"
     )
-    few_shot_assistant = "The 'popcorn' cells are classic for this disease. Final Answer: A"
+    few_shot_assistant_1 = (
+        "Reasoning: The presence of multilobated 'popcorn' cells is the pathognomonic histological "
+        "finding for Nodular lymphocyte predominant Hodgkin lymphoma. Final Answer: A"
+    )
+
+    few_shot_user_2 = (
+        "Question:\nA 32-year-old woman undergoes a routine Pap smear. The pathologist notes "
+        "squamous epithelial cells with hyperchromatic nuclei surrounded by a clear perinuclear halo. "
+        "What is the most likely cause?\n\n"
+        "Options:\n"
+        "A. Candida albicans\n"
+        "B. Trichomonas vaginalis\n"
+        "C. Herpes simplex virus (HSV)\n"
+        "D. Human papillomavirus (HPV)\n\n"
+        "Answer:"
+    )
+    few_shot_assistant_2 = (
+        "Reasoning: Epithelial cells with enlarged nuclei and perinuclear halos are koilocytes, "
+        "which are the classic hallmark of a Human papillomavirus (HPV) infection. Final Answer: D"
+    )
 
     actual_user = (
         f"Question:\n{row['question']}\n\n"
@@ -283,8 +304,10 @@ def build_prompt(row: pd.Series | Dict[str, object]) -> str:
     return (
         f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
         f"{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
-        f"{few_shot_user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        f"{few_shot_assistant}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"{few_shot_user_1}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        f"{few_shot_assistant_1}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"{few_shot_user_2}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        f"{few_shot_assistant_2}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
         f"{actual_user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     )
 

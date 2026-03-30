@@ -46,9 +46,9 @@ class TrainingConfig:
     use_holdout_test: bool = False
     split_path: str = "../saved_models/splits/default_holdout_split.json"
     tuning_split_path: str = "../saved_models/splits/default_train_val_split.json"
-    batch_size: int = 8
-    eval_batch_size: int = 4
-    learning_rate: float = 5e-5
+    batch_size: int = 2
+    eval_batch_size: int = 2
+    learning_rate: float = 2e-4
     num_epochs: int = 30
     weight_decay: float = 0.02
     warmup_ratio: float = 0.1
@@ -59,7 +59,7 @@ class TrainingConfig:
     early_stopping_patience: int = 40
     early_stopping_min_delta: float = 0.0
     max_length: int = 1024
-    grad_accum_steps: int = 4
+    grad_accum_steps: int = 16
     val_ratio: float = 0.1
     test_ratio: float = 0.1
     seed: int = 42
@@ -99,11 +99,23 @@ class PromptOnlyDataset(Dataset):
         self.examples = None if shuffle_options else [self._build_example(index) for index in range(len(self.dataframe))]
 
     def __len__(self) -> int:
-        """Return the number of rows in the dataset."""
+        """Return the number of dataset rows.
+
+        Returns:
+            The number of examples available in the dataset.
+        """
         return len(self.dataframe)
 
     def _build_example(self, index: int) -> Dict[str, torch.Tensor]:
-        """Tokenize and cache one prompt-only example."""
+        """Tokenize one prompt-only example.
+
+        Args:
+            index: Dataset row index.
+
+        Returns:
+            A dictionary containing encoded prompt tensors and associated
+            metadata such as ``question_id`` and optional ``target``.
+        """
         row = self.dataframe.iloc[index]
         if self.option_permutation is not None:
             row = permute_answer_options(row, self.option_permutation)
@@ -418,6 +430,9 @@ def configure_greedy_generation(model) -> None:
 
     Args:
         model: Causal language model whose generation config should be updated.
+
+    Returns:
+        None.
     """
     if getattr(model, "generation_config", None) is None:
         return
@@ -442,6 +457,7 @@ def create_model(config: TrainingConfig, tokenizer, device: torch.device):
     """
     model = AutoModelForCausalLM.from_pretrained(config.model_name)
     model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.use_cache = False
 
     if config.use_lora:
         target_modules = [module.strip() for module in config.lora_target_modules.split(",") if module.strip()]
@@ -456,6 +472,8 @@ def create_model(config: TrainingConfig, tokenizer, device: torch.device):
         )
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
+
+    model.gradient_checkpointing_enable()
 
     model.to(device)
     configure_greedy_generation(model)
@@ -488,6 +506,7 @@ def load_saved_model(model_dir: str | Path, tokenizer, device: torch.device):
         model = AutoModelForCausalLM.from_pretrained(model_dir)
 
     model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.use_cache = True
     model.to(device)
     configure_greedy_generation(model)
     return model
@@ -720,6 +739,9 @@ def train(config: TrainingConfig) -> None:
 
     Args:
         config: Training configuration values.
+
+    Returns:
+        None.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_dir = create_run_dir(config.output_dir)

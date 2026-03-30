@@ -123,6 +123,9 @@ def run_inference(
             option permutations for each example.
         num_option_order_permutations: Number of permutations used when
             ``option_order_ensemble`` is enabled.
+
+    Returns:
+        None.
     """
     model_dirs = [Path(model_dir) for model_dir in model_dirs]
     if not model_dirs:
