@@ -1,7 +1,7 @@
-matplotlib
-pandas
-peft
-scikit-learn
-torch
-transformers
-tqdm
+matplotlib==3.10.0
+pandas==2.2.3
+peft==0.14.0
+scikit-learn==1.6.1
+torch==2.5.1
+transformers==4.47.1
+tqdm==4.67.1
