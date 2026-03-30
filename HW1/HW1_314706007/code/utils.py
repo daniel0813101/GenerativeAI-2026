@@ -256,8 +256,9 @@ def build_prompt(row: pd.Series | Dict[str, object]) -> str:
     system_prompt = (
         "You are an expert, board-certified pathologist taking a high-stakes medical licensing exam. "
         "Analyze the clinical and histological findings to identify the correct diagnosis. "
-        "Briefly state the key reasoning, then strictly output the final answer letter. "
-        "Format your response exactly as shown in the examples."
+        "Respond in exactly one line using this format: "
+        "Reasoning: <short justification> Final Answer: <A/B/C/D>. "
+        "Do not output anything after the final answer."
     )
 
     few_shot_user_1 = (
@@ -309,6 +310,24 @@ def build_prompt(row: pd.Series | Dict[str, object]) -> str:
         f"{few_shot_user_2}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         f"{few_shot_assistant_2}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
         f"{actual_user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+
+
+def build_training_completion(row: pd.Series | Dict[str, object]) -> str:
+    """Construct a supervised completion aligned with inference-time formatting.
+
+    Args:
+        row: Labeled MCQ row containing shuffled or original answer options.
+
+    Returns:
+        A short reasoning line followed by the final answer letter.
+    """
+    answer_index = int(row["ans"])
+    answer_letter = ID_TO_LABEL[answer_index]
+    answer_option = str(row[OPTION_COLUMNS[answer_index]]).strip()
+    return (
+        f"Reasoning: The clinical and histologic findings are most consistent with {answer_option}. "
+        f"Final Answer: {answer_letter}<|eot_id|>"
     )
 
 
@@ -401,22 +420,61 @@ def label_text_to_id(label_text: str) -> int:
     return LABEL_TO_ID[label_text.strip().upper()]
 
 
-def extract_prediction(text: str) -> int:
+def _normalize_for_match(text: str) -> str:
+    """Normalize text for tolerant substring matching."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text.lower())).strip()
+
+
+def _match_prediction_from_options(text: str, options: Sequence[str] | None) -> int | None:
+    """Infer the predicted option from generated option text when no letter is found."""
+    if not options:
+        return None
+
+    normalized_text = _normalize_for_match(text)
+    matches: List[tuple[int, int, int]] = []
+    for option_index, option_text in enumerate(options):
+        normalized_option = _normalize_for_match(str(option_text))
+        if len(normalized_option) < 4:
+            continue
+        match_position = normalized_text.rfind(normalized_option)
+        if match_position != -1:
+            matches.append((match_position, len(normalized_option), option_index))
+
+    if not matches:
+        return None
+
+    matches.sort()
+    return matches[-1][2]
+
+
+def extract_prediction(text: str, options: Sequence[str] | None = None) -> int:
     """Robustly parse generated text for the chosen option letter.
 
     Args:
         text: Raw generated text from the model.
+        options: Optional answer option texts for row-aware fallback parsing.
 
     Returns:
         The predicted class id.
     """
-    match = re.search(r"Final Answer:\s*([A-D])", text, re.IGNORECASE)
-    if match:
-        return LABEL_TO_ID[match.group(1).upper()]
+    explicit_patterns = [
+        r"Final\s+Answer\s*[:\-]?\s*(?:Option\s*)?\(?([A-D])\)?",
+        r"Answer\s*[:\-]?\s*(?:Option\s*)?\(?([A-D])\)?",
+        r"Option\s*([A-D])\b",
+        r"Choice\s*([A-D])\b",
+    ]
+    for pattern in explicit_patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            return LABEL_TO_ID[matches[-1].upper()]
 
-    matches = re.findall(r"\b([A-D])\b", text, re.IGNORECASE)
-    if matches:
-        return LABEL_TO_ID[matches[-1].upper()]
+    option_match = _match_prediction_from_options(text, options)
+    if option_match is not None:
+        return option_match
+
+    tail_matches = re.findall(r"\b([A-D])\b", text[-160:], re.IGNORECASE)
+    if tail_matches:
+        return LABEL_TO_ID[tail_matches[-1].upper()]
 
     return 0
 

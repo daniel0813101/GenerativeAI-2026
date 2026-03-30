@@ -9,96 +9,8 @@ import pandas as pd
 import torch
 from transformers import AutoTokenizer
 
-from train_eval import load_saved_model
-from utils import extract_prediction, load_dataset
-
-
-def generate_predictions_from_dataframe(
-    model,
-    dataframe,
-    tokenizer,
-    device,
-    max_length,
-    batch_size,
-    option_order_ensemble,
-    num_option_order_permutations,
-):
-    """Generate predictions from a dataframe with optional option-order voting.
-
-    Args:
-        model: Fine-tuned causal language model used for generation.
-        dataframe: Benchmark dataframe containing unlabeled examples.
-        tokenizer: Tokenizer used to encode prompts and decode outputs.
-        device: Device used for inference.
-        max_length: Maximum prompt length.
-        batch_size: Evaluation batch size.
-        option_order_ensemble: Whether to run multiple option permutations and
-            hard-vote across them.
-        num_option_order_permutations: Number of permutations to evaluate when
-            option-order ensembling is enabled.
-
-    Returns:
-        A tuple containing final predicted labels and their corresponding
-        question ids.
-    """
-    from train_eval import create_prompt_dataloader
-    from utils import get_option_permutations
-
-    num_permutations = num_option_order_permutations if option_order_ensemble else 1
-    permutations = get_option_permutations(num_permutations)
-
-    all_permutation_preds = []
-    question_ids = None
-
-    for permutation in permutations:
-        dataloader = create_prompt_dataloader(
-            dataframe,
-            tokenizer,
-            max_length,
-            batch_size,
-            num_workers=0,
-            pin_memory=device.type == "cuda",
-            option_permutation=permutation,
-        )
-
-        perm_preds = []
-        batch_q_ids = []
-        with torch.no_grad():
-            for batch in dataloader:
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-
-                generated_ids = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=25,  # Allows short text, prevents long rambling
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    do_sample=False,
-                )
-                input_lengths = attention_mask.sum(dim=1).tolist()
-                generated_texts = [
-                    tokenizer.decode(output_ids[int(input_length):], skip_special_tokens=True)
-                    for output_ids, input_length in zip(generated_ids, input_lengths)
-                ]
-
-                for text, q_id in zip(generated_texts, batch["question_id"].tolist()):
-                    pred_idx = extract_prediction(text)
-                    original_idx = permutation[pred_idx]
-                    perm_preds.append(original_idx)
-                    batch_q_ids.append(q_id)
-
-        all_permutation_preds.append(perm_preds)
-        if question_ids is None:
-            question_ids = batch_q_ids
-
-    final_preds = []
-    for i in range(len(question_ids)):
-        votes = [perm_preds[i] for perm_preds in all_permutation_preds]
-        winner = Counter(votes).most_common(1)[0][0]
-        final_preds.append(winner)
-
-    return final_preds, question_ids
+from train_eval import generate_predictions_from_dataframe, load_saved_model
+from utils import load_dataset
 
 
 def run_inference(
@@ -107,8 +19,9 @@ def run_inference(
     output_csv: str | Path | None,
     max_length: int = 1024,
     batch_size: int = 4,
-    option_order_ensemble: bool = False,
+    option_order_ensemble: bool = True,
     num_option_order_permutations: int = 4,
+    max_new_tokens: int = 40,
 ) -> None:
     """Run benchmark inference and export hard-voted predictions to CSV.
 
@@ -123,6 +36,7 @@ def run_inference(
             option permutations for each example.
         num_option_order_permutations: Number of permutations used when
             ``option_order_ensemble`` is enabled.
+        max_new_tokens: Maximum generation length for each answer.
 
     Returns:
         None.
@@ -145,16 +59,21 @@ def run_inference(
     for model_dir in model_dirs:
         model = load_saved_model(model_dir, tokenizer, device)
         model.eval()
-        model_preds, batch_q_ids = generate_predictions_from_dataframe(
+        predictions_df = generate_predictions_from_dataframe(
             model,
             benchmark_df,
             tokenizer,
             device,
-            max_length,
-            batch_size,
-            option_order_ensemble,
-            num_option_order_permutations,
+            max_length=max_length,
+            batch_size=batch_size,
+            num_workers=0,
+            pin_memory=device.type == "cuda",
+            option_order_ensemble=option_order_ensemble,
+            num_option_order_permutations=num_option_order_permutations,
+            max_new_tokens=max_new_tokens,
         )
+        model_preds = predictions_df["prediction"].tolist()
+        batch_q_ids = predictions_df["question_id"].tolist()
         if question_ids is None:
             question_ids = batch_q_ids
         elif batch_q_ids != question_ids:
@@ -191,8 +110,9 @@ def parse_args():
     parser.add_argument("--output_csv", type=str, default=None)
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--option_order_ensemble", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--option_order_ensemble", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num_option_order_permutations", type=int, default=4)
+    parser.add_argument("--max_new_tokens", type=int, default=40)
     return parser.parse_args()
 
 
@@ -206,4 +126,5 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         option_order_ensemble=args.option_order_ensemble,
         num_option_order_permutations=args.num_option_order_permutations,
+        max_new_tokens=args.max_new_tokens,
     )

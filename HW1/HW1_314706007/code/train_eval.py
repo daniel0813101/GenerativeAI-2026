@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from datetime import datetime
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Dict, List, Sequence
 
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from peft import LoraConfig, PeftConfig, PeftModel, TaskType, get_peft_model
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
@@ -15,12 +17,14 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 
 from utils import (
-    ID_TO_LABEL,
+    OPTION_COLUMNS,
     SupervisedCollator,
     build_kfold_splits,
     build_prompt,
+    build_training_completion,
     compute_accuracy,
     extract_prediction,
+    get_option_permutations,
     load_dataset,
     plot_test_results,
     plot_training_history,
@@ -46,9 +50,9 @@ class TrainingConfig:
     use_holdout_test: bool = False
     split_path: str = "../saved_models/splits/default_holdout_split.json"
     tuning_split_path: str = "../saved_models/splits/default_train_val_split.json"
-    batch_size: int = 2
-    eval_batch_size: int = 2
-    learning_rate: float = 2e-4
+    batch_size: int = 8
+    eval_batch_size: int = 4
+    learning_rate: float = 5e-5
     num_epochs: int = 30
     weight_decay: float = 0.02
     warmup_ratio: float = 0.1
@@ -56,10 +60,11 @@ class TrainingConfig:
     shuffle_option_augmentation: bool = True
     option_order_ensemble: bool = True
     num_option_order_permutations: int = 4
+    generation_max_new_tokens: int = 40
     early_stopping_patience: int = 40
     early_stopping_min_delta: float = 0.0
     max_length: int = 1024
-    grad_accum_steps: int = 16
+    grad_accum_steps: int = 4
     val_ratio: float = 0.1
     test_ratio: float = 0.1
     seed: int = 42
@@ -133,6 +138,7 @@ class PromptOnlyDataset(Dataset):
         if "ans" in row:
             item["target"] = torch.tensor(int(row["ans"]), dtype=torch.long)
         item["question_id"] = torch.tensor(int(row["question_id"]), dtype=torch.long)
+        item["options"] = tuple(str(row[column]).strip() for column in OPTION_COLUMNS)
         return item
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
@@ -188,10 +194,7 @@ class SupervisedDataset(Dataset):
             row = shuffle_answer_options(row)
 
         prompt = build_prompt(row)
-
-        # Match the few-shot training target used during inference prompting.
-        ans_letter = ID_TO_LABEL[int(row["ans"])]
-        answer_text = f"The evidence points to this diagnosis. Final Answer: {ans_letter}<|eot_id|>"
+        answer_text = build_training_completion(row)
         full_text = prompt + answer_text
         encoded = self.tokenizer(full_text, truncation=True, max_length=self.max_length, return_tensors="pt")
         input_ids = encoded["input_ids"].squeeze(0)
@@ -245,6 +248,7 @@ def prompt_collate_fn(features: List[Dict[str, torch.Tensor]], tokenizer) -> Dic
     if "target" in features[0]:
         batch["target"] = torch.stack([feature["target"] for feature in features])
     batch["question_id"] = torch.stack([feature["question_id"] for feature in features])
+    batch["options"] = [feature["options"] for feature in features]
     return batch
 
 
@@ -288,10 +292,23 @@ def create_prompt_dataloader(
     )
 
 
+def compute_supervised_loss(logits, labels: torch.Tensor, label_smoothing: float) -> torch.Tensor:
+    """Compute causal-LM loss with optional label smoothing."""
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    return F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        ignore_index=-100,
+        label_smoothing=label_smoothing,
+    )
+
+
 def evaluate_supervised_loss(
     model,
     dataloader: DataLoader,
     device: torch.device,
+    label_smoothing: float,
 ) -> float:
     """Compute average causal-LM loss over supervised labels.
 
@@ -315,8 +332,9 @@ def evaluate_supervised_loss(
             attention_mask = batch.attention_mask.to(device, non_blocking=True)
             labels = batch.labels.to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            running_loss += outputs.loss.item()
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                loss = compute_supervised_loss(outputs.logits, labels, label_smoothing)
+            running_loss += loss.item()
             batch_count += 1
 
     return running_loss / max(batch_count, 1)
@@ -327,6 +345,7 @@ def collect_generated_predictions(
     dataloader: DataLoader,
     tokenizer,
     device: torch.device,
+    max_new_tokens: int,
 ) -> pd.DataFrame:
     """Generate responses and extract final answer predictions into a DataFrame.
 
@@ -350,7 +369,7 @@ def collect_generated_predictions(
             generated_ids = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=100,
+                max_new_tokens=max_new_tokens,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 do_sample=False,
@@ -362,12 +381,14 @@ def collect_generated_predictions(
             ]
 
             targets = batch["target"].tolist() if "target" in batch else [None] * len(generated_texts)
-            for question_id, text, target in zip(
+            batch_options = batch.get("options", [None] * len(generated_texts))
+            for question_id, text, target, options in zip(
                 batch["question_id"].tolist(),
                 generated_texts,
                 targets,
+                batch_options,
             ):
-                prediction = extract_prediction(text)
+                prediction = extract_prediction(text, options=options)
                 row = {
                     "question_id": question_id,
                     "prediction": prediction,
@@ -381,24 +402,117 @@ def collect_generated_predictions(
     return pd.DataFrame(rows)
 
 
-def evaluate_generation_accuracy(
+def generate_predictions_from_dataframe(
     model,
-    dataloader: DataLoader,
+    dataframe: pd.DataFrame,
     tokenizer,
     device: torch.device,
-) -> float:
-    """Compute accuracy from generated explanations and final answers.
+    max_length: int,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    option_order_ensemble: bool,
+    num_option_order_permutations: int,
+    max_new_tokens: int,
+) -> pd.DataFrame:
+    """Generate predictions with optional hard voting over option orderings.
 
     Args:
         model: Causal language model used for generation.
-        dataloader: Dataloader yielding prompt-only labeled batches.
+        dataframe: Benchmark or validation dataframe.
         tokenizer: Tokenizer used to decode generated tokens.
         device: Device used for inference.
+        max_length: Maximum prompt length.
+        batch_size: Evaluation batch size.
+        num_workers: Number of dataloader workers.
+        pin_memory: Whether to pin host memory for faster device transfers.
+        option_order_ensemble: Whether to hard-vote across option permutations.
+        num_option_order_permutations: Number of permutations to evaluate.
+        max_new_tokens: Maximum completion length during generation.
 
     Returns:
-        Accuracy computed from parsed generated answers.
+        A dataframe containing final predictions and optional labels.
     """
-    predictions_df = collect_generated_predictions(model, dataloader, tokenizer, device)
+    num_permutations = num_option_order_permutations if option_order_ensemble else 1
+    permutations = get_option_permutations(num_permutations)
+
+    all_permutation_predictions: List[List[int]] = []
+    question_ids = None
+    targets = None
+    generated_texts = None
+
+    for permutation in permutations:
+        dataloader = create_prompt_dataloader(
+            dataframe,
+            tokenizer,
+            max_length=max_length,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            option_permutation=permutation,
+        )
+        predictions_df = collect_generated_predictions(
+            model,
+            dataloader,
+            tokenizer,
+            device,
+            max_new_tokens=max_new_tokens,
+        )
+        mapped_predictions = [permutation[prediction] for prediction in predictions_df["prediction"].tolist()]
+        all_permutation_predictions.append(mapped_predictions)
+
+        if question_ids is None:
+            question_ids = predictions_df["question_id"].tolist()
+            generated_texts = predictions_df["generated_text"].tolist()
+            if "target" in predictions_df:
+                targets = predictions_df["target"].tolist()
+
+    final_predictions = []
+    for index in range(len(question_ids or [])):
+        votes = [predictions[index] for predictions in all_permutation_predictions]
+        winner = Counter(votes).most_common(1)[0][0]
+        final_predictions.append(winner)
+
+    result = pd.DataFrame(
+        {
+            "question_id": question_ids,
+            "prediction": final_predictions,
+            "generated_text": generated_texts,
+        }
+    )
+    if targets is not None:
+        result["target"] = targets
+        result["correct"] = (result["prediction"] == result["target"]).astype(int)
+    return result
+
+
+def evaluate_generation_accuracy(
+    model,
+    dataframe: pd.DataFrame,
+    tokenizer,
+    device: torch.device,
+    max_length: int,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    option_order_ensemble: bool,
+    num_option_order_permutations: int,
+    max_new_tokens: int,
+) -> float:
+    """Compute accuracy from generated explanations and final answers."""
+    predictions_df = generate_predictions_from_dataframe(
+        model,
+        dataframe,
+        tokenizer,
+        device,
+        max_length=max_length,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        option_order_ensemble=option_order_ensemble,
+        num_option_order_permutations=num_option_order_permutations,
+        max_new_tokens=max_new_tokens,
+    )
     return compute_accuracy(
         predictions_df["prediction"].tolist(),
         predictions_df["target"].tolist(),
@@ -565,12 +679,6 @@ def train_one_split(
         shuffle_options=config.shuffle_option_augmentation,
     )
     val_supervised_dataset = SupervisedDataset(val_df, tokenizer, config.max_length)
-    val_prompt_dataset = PromptOnlyDataset(val_df, tokenizer, config.max_length)
-    test_prompt_dataset = (
-        PromptOnlyDataset(test_df, tokenizer, config.max_length)
-        if test_df is not None
-        else None
-    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -587,26 +695,6 @@ def train_one_split(
         num_workers=config.num_workers,
         pin_memory=pin_memory,
         collate_fn=SupervisedCollator(tokenizer),
-    )
-    val_prompt_loader = DataLoader(
-        val_prompt_dataset,
-        batch_size=config.eval_batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=pin_memory,
-        collate_fn=lambda batch: prompt_collate_fn(batch, tokenizer),
-    )
-    test_prompt_loader = (
-        DataLoader(
-            test_prompt_dataset,
-            batch_size=config.eval_batch_size,
-            shuffle=False,
-            num_workers=config.num_workers,
-            pin_memory=pin_memory,
-            collate_fn=lambda batch: prompt_collate_fn(batch, tokenizer),
-        )
-        if test_prompt_dataset is not None
-        else None
     )
 
     optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
@@ -637,8 +725,12 @@ def train_one_split(
             labels = batch.labels.to(device, non_blocking=True)
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss / config.grad_accum_steps
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                loss = compute_supervised_loss(
+                    outputs.logits,
+                    labels,
+                    config.label_smoothing,
+                ) / config.grad_accum_steps
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -658,8 +750,25 @@ def train_one_split(
             progress_bar.set_postfix(loss=f"{running_loss / step:.4f}")
 
         train_loss = running_loss / max(len(train_loader), 1)
-        val_loss = evaluate_supervised_loss(model, val_supervised_loader, device)
-        val_accuracy = evaluate_generation_accuracy(model, val_prompt_loader, tokenizer, device)
+        val_loss = evaluate_supervised_loss(
+            model,
+            val_supervised_loader,
+            device,
+            config.label_smoothing,
+        )
+        val_accuracy = evaluate_generation_accuracy(
+            model,
+            val_df,
+            tokenizer,
+            device,
+            max_length=config.max_length,
+            batch_size=config.eval_batch_size,
+            num_workers=config.num_workers,
+            pin_memory=pin_memory,
+            option_order_ensemble=config.option_order_ensemble,
+            num_option_order_permutations=config.num_option_order_permutations,
+            max_new_tokens=config.generation_max_new_tokens,
+        )
 
         epoch_log = {
             "epoch": epoch,
@@ -701,8 +810,20 @@ def train_one_split(
         "train_size": len(train_df),
         "val_size": len(val_df),
     }
-    if test_prompt_loader is not None and test_df is not None:
-        test_predictions_df = collect_generated_predictions(best_model, test_prompt_loader, tokenizer, device)
+    if test_df is not None:
+        test_predictions_df = generate_predictions_from_dataframe(
+            best_model,
+            test_df,
+            tokenizer,
+            device,
+            max_length=config.max_length,
+            batch_size=config.eval_batch_size,
+            num_workers=config.num_workers,
+            pin_memory=pin_memory,
+            option_order_ensemble=config.option_order_ensemble,
+            num_option_order_permutations=config.num_option_order_permutations,
+            max_new_tokens=config.generation_max_new_tokens,
+        )
         test_accuracy = compute_accuracy(
             test_predictions_df["prediction"].tolist(),
             test_predictions_df["target"].tolist(),
