@@ -5,8 +5,11 @@ import argparse
 import json
 import math
 import re
+import sys
+import time
 from collections import Counter
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
+from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -39,7 +42,9 @@ class TrainConfig:
     """
 
     input: str = str(SCRIPT_DIR / "dataset" / "private_dataset.json")
-    output: str = str(SCRIPT_DIR / "submission_dev.json")
+    output_root: str = str(SCRIPT_DIR / "checkpoints")
+    run_name: str | None = None
+    submission_filename: str = "submission.json"
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     disable_rerank: bool = False
@@ -72,10 +77,22 @@ class TrainConfig:
             help="Input dataset path",
         )
         parser.add_argument(
-            "--output",
+            "--output-root",
             type=str,
-            default=defaults.output,
-            help="Output prediction JSON path",
+            default=defaults.output_root,
+            help="Root directory for timestamped run folders",
+        )
+        parser.add_argument(
+            "--run-name",
+            type=str,
+            default=defaults.run_name,
+            help="Optional run folder name (default: current timestamp)",
+        )
+        parser.add_argument(
+            "--submission-filename",
+            type=str,
+            default=defaults.submission_filename,
+            help="Filename for submission JSON inside each run folder",
         )
         parser.add_argument(
             "--embedding-model",
@@ -165,6 +182,78 @@ def parse_args() -> TrainConfig:
     parser = TrainConfig.build_arg_parser()
     namespace = parser.parse_args()
     return TrainConfig.from_namespace(namespace)
+
+
+def resolve_run_name(explicit_name: str | None, now: datetime | None = None) -> str:
+    """Resolve run folder name from explicit value or timestamp.
+
+    Args:
+        explicit_name: User-provided run name.
+        now: Optional datetime override, mainly for deterministic tests.
+
+    Returns:
+        str: A filesystem-safe run folder name.
+    """
+    if explicit_name and explicit_name.strip():
+        return explicit_name.strip()
+    now = now or datetime.now()
+    return now.strftime("%Y%m%d_%H%M%S")
+
+
+def create_run_dir(output_root: str, run_name: str) -> Path:
+    """Create a unique run directory.
+
+    If the target name already exists, the function appends an incremental
+    suffix (e.g. ``_01``) until an unused directory is found.
+
+    Args:
+        output_root: Root directory where runs are stored.
+        run_name: Preferred run folder name.
+
+    Returns:
+        Path: Newly created run directory path.
+    """
+    root = Path(output_root)
+    root.mkdir(parents=True, exist_ok=True)
+
+    candidate = root / run_name
+    if not candidate.exists():
+        candidate.mkdir(parents=True, exist_ok=False)
+        return candidate
+
+    index = 1
+    while True:
+        next_candidate = root / f"{run_name}_{index:02d}"
+        if not next_candidate.exists():
+            next_candidate.mkdir(parents=True, exist_ok=False)
+            return next_candidate
+        index += 1
+
+
+def write_json(path: Path, payload: object) -> None:
+    """Write JSON payload to disk with UTF-8 encoding.
+
+    Args:
+        path: Destination path.
+        payload: JSON-serializable object.
+    """
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def print_run_folder_structure(run_dir: Path, submission_filename: str) -> None:
+    """Print the checkpoint folder structure for one run.
+
+    Args:
+        run_dir: Generated run directory.
+        submission_filename: Submission JSON filename under ``run_dir``.
+    """
+    console.print("[bold]Run folder structure:[/bold]")
+    console.print(f"{run_dir}/")
+    console.print("├── config.json")
+    console.print("├── run_info.json")
+    console.print("├── per_item_stats.json")
+    console.print(f"└── {submission_filename}")
 
 
 def normalize_spaces(text: str) -> str:
@@ -502,14 +591,16 @@ def ensure_evidence_count(evidence: list[str], k: int) -> list[str]:
     return dedup[:k]
 
 
-def run_pipeline(config: TrainConfig) -> list[dict]:
+def run_pipeline(config: TrainConfig) -> tuple[list[dict], list[dict]]:
     """Run end-to-end RAG inference on a dataset file.
 
     Args:
         config: Runtime configuration for retrieval and generation.
 
     Returns:
-        list[dict]: Prediction rows in submission format.
+        tuple[list[dict], list[dict]]:
+            - Prediction rows in submission format.
+            - Per-item retrieval/generation statistics.
 
     Raises:
         FileNotFoundError: If the input dataset path does not exist.
@@ -544,6 +635,7 @@ def run_pipeline(config: TrainConfig) -> list[dict]:
     )
 
     outputs: list[dict] = []
+    per_item_stats: list[dict] = []
     progress = Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -566,6 +658,16 @@ def run_pipeline(config: TrainConfig) -> list[dict]:
             if not chunks:
                 fallback = "Insufficient evidence."
                 outputs.append({"title": title, "answer": fallback, "evidence": [fallback]})
+                per_item_stats.append(
+                    {
+                        "title": title,
+                        "num_chunks": 0,
+                        "num_candidates": 0,
+                        "num_evidence": 1,
+                        "llm_error": True,
+                        "answer_chars": len(fallback),
+                    }
+                )
                 progress.advance(task)
                 continue
 
@@ -597,15 +699,18 @@ def run_pipeline(config: TrainConfig) -> list[dict]:
             evidence = ensure_evidence_count([chunks[i].text for i in final_idx], k=evidence_k)
             prompt = make_answer_prompt(title=title, question=question, evidence_texts=evidence)
 
+            llm_error = False
             try:
                 resp = llm.invoke(prompt)
                 answer = to_text_response(resp)
             except Exception as exc:  # noqa: BLE001
                 console.print(f"[yellow]LLM error on '{title}':[/yellow] {exc}")
                 answer = "Insufficient evidence."
+                llm_error = True
 
             if not answer:
                 answer = "Insufficient evidence."
+                llm_error = True
 
             outputs.append(
                 {
@@ -614,22 +719,61 @@ def run_pipeline(config: TrainConfig) -> list[dict]:
                     "evidence": evidence,
                 }
             )
+            per_item_stats.append(
+                {
+                    "title": title,
+                    "num_chunks": len(chunks),
+                    "num_candidates": len(candidate_idx),
+                    "num_evidence": len(evidence),
+                    "llm_error": llm_error,
+                    "answer_chars": len(answer),
+                }
+            )
             progress.advance(task)
-    return outputs
+    return outputs, per_item_stats
 
 
 def main() -> None:
-    """Execute the CLI entrypoint and write predictions to disk."""
+    """Execute the CLI entrypoint and write run artifacts to a checkpoint folder."""
     config = parse_args()
-    outputs = run_pipeline(config)
 
-    out_path = Path(config.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(outputs, f, indent=2, ensure_ascii=False)
+    started_at = datetime.now().astimezone()
+    timer_start = time.perf_counter()
 
-    console.print(f"[green]Saved predictions:[/green] {out_path}")
-    console.print(f"Entries: {len(outputs)}")
+    run_name = resolve_run_name(config.run_name, now=started_at)
+    run_dir = create_run_dir(config.output_root, run_name)
+    submission_path = run_dir / config.submission_filename
+    config_path = run_dir / "config.json"
+    run_info_path = run_dir / "run_info.json"
+    stats_path = run_dir / "per_item_stats.json"
+
+    write_json(config_path, asdict(config))
+
+    predictions, per_item_stats = run_pipeline(config)
+
+    write_json(submission_path, predictions)
+    write_json(stats_path, per_item_stats)
+
+    finished_at = datetime.now().astimezone()
+    duration_seconds = round(time.perf_counter() - timer_start, 3)
+
+    run_info = {
+        "run_name": run_dir.name,
+        "started_at": started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "duration_seconds": duration_seconds,
+        "input_path": str(Path(config.input).resolve()),
+        "python_version": sys.version,
+        "num_predictions": len(predictions),
+        "submission_path": str(submission_path.resolve()),
+        "config_path": str(config_path.resolve()),
+        "per_item_stats_path": str(stats_path.resolve()),
+    }
+    write_json(run_info_path, run_info)
+
+    print_run_folder_structure(run_dir, config.submission_filename)
+    console.print(f"[green]Saved submission:[/green] {submission_path}")
+    console.print(f"Entries: {len(predictions)}")
 
 
 if __name__ == "__main__":
