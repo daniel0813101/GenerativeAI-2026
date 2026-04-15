@@ -50,17 +50,17 @@ class TrainConfig:
     disable_rerank: bool = False
     chunk_size: int = 700
     chunk_overlap: int = 100
-    retrieval_k: int = 14
+    retrieval_k: int = 32
     evidence_k: int = 3
     dynamic_evidence: bool = True
-    min_evidence_k: int = 2
-    max_evidence_k: int = 6
-    evidence_score_threshold: float = 0.78
+    min_evidence_k: int = 3
+    max_evidence_k: int = 10
+    evidence_score_threshold: float = 0.65
     rrf_k: int = 60
     use_bge_instructions: bool = True
     evidence_mode: str = "sentence"
-    evidence_source_chunks: int = 4
-    evidence_max_chars: int = 320
+    evidence_source_chunks: int = 6
+    evidence_max_chars: int = 500
     ollama_base_url: str = "http://127.0.0.1:11434"
     llm_model: str = "llama3.2:3b"
     llm_temperature: float = 0.2
@@ -126,7 +126,7 @@ class TrainConfig:
             "--retrieval-k",
             type=int,
             default=defaults.retrieval_k,
-            help="Candidates kept after hybrid retrieval",
+            help="Candidates kept after hybrid retrieval (increased for better recall)",
         )
         parser.add_argument(
             "--evidence-k",
@@ -144,7 +144,7 @@ class TrainConfig:
             "--min-evidence-k",
             type=int,
             default=defaults.min_evidence_k,
-            help="Minimum evidence count when dynamic evidence is enabled",
+            help="Minimum evidence count when dynamic evidence is enabled (raised for better coverage)",
         )
         parser.add_argument(
             "--max-evidence-k",
@@ -156,7 +156,7 @@ class TrainConfig:
             "--evidence-score-threshold",
             type=float,
             default=defaults.evidence_score_threshold,
-            help="Adaptive threshold in [0,1] for selecting additional evidence",
+            help="Adaptive threshold in [0,1] for selecting additional evidence (lowered to less strict)",
         )
         parser.add_argument("--rrf-k", type=int, default=defaults.rrf_k, help="RRF constant for rank fusion")
         parser.add_argument(
@@ -182,7 +182,7 @@ class TrainConfig:
             "--evidence-max-chars",
             type=int,
             default=defaults.evidence_max_chars,
-            help="Max characters per evidence snippet",
+            help="Max characters per evidence snippet (increased to preserve critical context)",
         )
         parser.add_argument(
             "--ollama-base-url",
@@ -592,7 +592,7 @@ def make_answer_prompt(title: str, question: str, evidence_texts: Sequence[str])
         "Rules:\n"
         "1) Use only the provided evidence.\n"
         "2) If evidence is insufficient, say exactly: Insufficient evidence.\n"
-        "3) Keep the answer concise (1-2 sentences).\n\n"
+        "3) Keep the answer concise (2-4 sentences). Cover key mechanisms and results if present.\n\n"
         f"Paper title: {title}\n"
         f"Question: {question}\n\n"
         f"{evidence_block}\n\n"
@@ -698,6 +698,36 @@ def split_sentences(text: str) -> list[str]:
     return result
 
 
+def generate_query_variants(question: str, llm: ChatOllama) -> list[str]:
+    """Generate 3 query rewrites for multi-query retrieval (RAG-Fusion).
+
+    Generates alternative phrasings to improve recall by retrieving from
+    multiple query perspectives, then fuses results with RRF.
+
+    Args:
+        question: Original question.
+        llm: LLM to generate variants.
+
+    Returns:
+        list[str]: Original + 2 rewritten queries (3 total).
+    """
+    prompt = (
+        f"Given this question about an NLP paper, generate 2 alternative search queries or phrasings "
+        f"that would retrieve relevant information. Return only the 2 queries, one per line, no numbering.\\n\\n"
+        f"Question: {question}"
+    )
+    try:
+        resp = llm.invoke(prompt)
+        variants = to_text_response(resp).split("\n")
+        variants = [v.strip() for v in variants if v.strip()]
+        result = [question] + variants[:2]
+        while len(result) < 3:
+            result.append(question)
+        return result[:3]
+    except Exception:
+        return [question, question, question]
+
+
 def lexical_overlap_score(sentence: str, question_tokens: Sequence[str]) -> float:
     """Compute a simple lexical overlap score for one sentence.
 
@@ -791,7 +821,10 @@ def select_sentence_evidence(
     evidence_source_chunks: int,
     evidence_max_chars: int,
 ) -> list[str]:
-    """Select sentence-level evidence from top-ranked chunks.
+    """Select sentence-level evidence from top-ranked chunks with context windows.
+
+    Extracts high-scoring sentences plus their neighboring sentences (±1) to preserve
+    local context, improving both correctness and ROUGE-L coverage.
 
     Args:
         question: Original question text.
@@ -809,7 +842,7 @@ def select_sentence_evidence(
         evidence_max_chars: Maximum characters per snippet.
 
     Returns:
-        list[str]: Ranked sentence-level evidence snippets.
+        list[str]: Ranked sentence-level evidence snippets with local context.
     """
     source_count = max(1, min(len(chunk_indices), evidence_source_chunks))
     source_indices = list(chunk_indices[:source_count])
@@ -825,16 +858,15 @@ def select_sentence_evidence(
     dense_scores = sent_emb @ question_emb
     q_tokens = tokenize(question)
 
-    blended: list[tuple[float, str]] = []
-    for sent, dense_score in zip(candidates, dense_scores):
+    blended: list[tuple[float, str, int]] = []
+    for sent_idx, (sent, dense_score) in enumerate(zip(candidates, dense_scores)):
         lex = lexical_overlap_score(sent, q_tokens)
         score = float(dense_score) + 0.15 * lex
-        blended.append((score, sent))
+        blended.append((score, sent, sent_idx))
 
-    ranked_pairs = sorted(blended, key=lambda x: x[0], reverse=True)
-    ranked_scores = [score for score, _ in ranked_pairs]
-    ranked = [s for _, s in ranked_pairs]
-
+    ranked_tuples = sorted(blended, key=lambda x: x[0], reverse=True)
+    ranked_scores = [score for score, _, _ in ranked_tuples]
+    
     if dynamic_evidence:
         target_k = adaptive_k_from_scores(
             ranked_scores,
@@ -843,18 +875,36 @@ def select_sentence_evidence(
             threshold=evidence_score_threshold,
         )
     else:
-        target_k = max(1, min(evidence_k, len(ranked)))
+        target_k = max(1, min(evidence_k, len(ranked_tuples)))
 
+    selected_indices = set()
     deduped: list[str] = []
     seen = set()
-    for sent in ranked:
-        trimmed = trim_evidence_length(sent, evidence_max_chars)
+
+    for score, sent, sent_idx in ranked_tuples:
+        if len(deduped) >= target_k:
+            break
+        if sent_idx in selected_indices:
+            continue
+        
+        selected_indices.add(sent_idx)
+        
+        context_sents = [sent]
+        if sent_idx > 0 and sent_idx - 1 not in selected_indices:
+            context_sents.insert(0, candidates[sent_idx - 1])
+            selected_indices.add(sent_idx - 1)
+        if sent_idx < len(candidates) - 1 and sent_idx + 1 not in selected_indices:
+            context_sents.append(candidates[sent_idx + 1])
+            selected_indices.add(sent_idx + 1)
+        
+        combined = " ".join(context_sents)
+        trimmed = trim_evidence_length(combined, evidence_max_chars)
+        
         if trimmed in seen:
             continue
         seen.add(trimmed)
         deduped.append(trimmed)
-        if len(deduped) >= target_k:
-            break
+    
     return deduped
 
 
@@ -947,18 +997,33 @@ def run_pipeline(config: TrainConfig) -> tuple[list[dict], list[dict]]:
 
             chunk_texts = [c.text for c in chunks]
             doc_inputs = apply_bge_passage_prefix(chunk_texts, config.use_bge_instructions)
-            query_input = apply_bge_query_prefix(question, config.use_bge_instructions)
             doc_emb = embedder.encode(doc_inputs, normalize_embeddings=True, convert_to_numpy=True)
-            query_emb = embedder.encode([query_input], normalize_embeddings=True, convert_to_numpy=True)[0]
-            dense_scores = doc_emb @ query_emb
-            dense_rank = argsort_desc(dense_scores)
-
+            
             idf, avgdl = build_bm25_stats(chunks)
-            bm25 = bm25_scores(tokenize(question), chunks, idf, avgdl)
-            sparse_rank = argsort_desc(bm25)
-
-            fused = reciprocal_rank_fusion([dense_rank, sparse_rank], rrf_k=config.rrf_k)
+            
+            query_variants = generate_query_variants(question, llm)
+            
+            all_dense_ranks = []
+            all_sparse_ranks = []
+            question_embeddings = []
+            
+            for variant_question in query_variants:
+                variant_input = apply_bge_query_prefix(variant_question, config.use_bge_instructions)
+                variant_emb = embedder.encode([variant_input], normalize_embeddings=True, convert_to_numpy=True)[0]
+                question_embeddings.append(variant_emb)
+                
+                variant_dense_scores = doc_emb @ variant_emb
+                variant_dense_rank = argsort_desc(variant_dense_scores)
+                all_dense_ranks.append(variant_dense_rank)
+                
+                variant_bm25 = bm25_scores(tokenize(variant_question), chunks, idf, avgdl)
+                variant_sparse_rank = argsort_desc(variant_bm25)
+                all_sparse_ranks.append(variant_sparse_rank)
+            
+            fused = reciprocal_rank_fusion(all_dense_ranks + all_sparse_ranks, rrf_k=config.rrf_k)
             candidate_idx = topn_indices(fused, n=min(retrieval_k, len(chunks)))
+            
+            query_emb = question_embeddings[0]
 
             ranked_chunk_pairs: list[tuple[int, float]]
             if reranker is not None and candidate_idx:
