@@ -52,6 +52,10 @@ class TrainConfig:
     chunk_overlap: int = 100
     retrieval_k: int = 14
     evidence_k: int = 3
+    dynamic_evidence: bool = True
+    min_evidence_k: int = 2
+    max_evidence_k: int = 6
+    evidence_score_threshold: float = 0.78
     rrf_k: int = 60
     use_bge_instructions: bool = True
     evidence_mode: str = "sentence"
@@ -128,7 +132,31 @@ class TrainConfig:
             "--evidence-k",
             type=int,
             default=defaults.evidence_k,
-            help="Evidence chunks to submit per question (1-40)",
+            help="Fixed evidence count per question (used when --no-dynamic-evidence)",
+        )
+        parser.add_argument(
+            "--dynamic-evidence",
+            action=argparse.BooleanOptionalAction,
+            default=defaults.dynamic_evidence,
+            help="Use adaptive evidence count per question",
+        )
+        parser.add_argument(
+            "--min-evidence-k",
+            type=int,
+            default=defaults.min_evidence_k,
+            help="Minimum evidence count when dynamic evidence is enabled",
+        )
+        parser.add_argument(
+            "--max-evidence-k",
+            type=int,
+            default=defaults.max_evidence_k,
+            help="Maximum evidence count when dynamic evidence is enabled",
+        )
+        parser.add_argument(
+            "--evidence-score-threshold",
+            type=float,
+            default=defaults.evidence_score_threshold,
+            help="Adaptive threshold in [0,1] for selecting additional evidence",
         )
         parser.add_argument("--rrf-k", type=int, default=defaults.rrf_k, help="RRF constant for rank fusion")
         parser.add_argument(
@@ -705,6 +733,49 @@ def trim_evidence_length(text: str, max_chars: int) -> str:
     return text[:max_chars].rstrip() + " ..."
 
 
+def adaptive_k_from_scores(
+    scores_desc: Sequence[float],
+    min_k: int,
+    max_k: int,
+    threshold: float,
+) -> int:
+    """Choose adaptive evidence count from descending confidence scores.
+
+    The score threshold is applied on per-question min-max normalized scores,
+    so it is robust to differences in score scale across questions.
+
+    Args:
+        scores_desc: Scores sorted in descending order.
+        min_k: Minimum number of items to keep.
+        max_k: Maximum number of items to keep.
+        threshold: Normalized score threshold in [0, 1].
+
+    Returns:
+        int: Selected number of items.
+    """
+    if not scores_desc:
+        return 0
+
+    n = min(len(scores_desc), max(1, max_k))
+    min_k = max(1, min(min_k, n))
+    threshold = max(0.0, min(1.0, threshold))
+
+    window = list(scores_desc[:n])
+    top = window[0]
+    tail = window[-1]
+    if abs(top - tail) <= 1e-8:
+        return n
+
+    selected = min_k
+    for i in range(min_k, n):
+        normalized = (window[i] - tail) / (top - tail)
+        if normalized >= threshold:
+            selected = i + 1
+        else:
+            break
+    return selected
+
+
 def select_sentence_evidence(
     question: str,
     chunks: Sequence[Chunk],
@@ -713,6 +784,10 @@ def select_sentence_evidence(
     question_emb: np.ndarray,
     use_bge_instructions: bool,
     evidence_k: int,
+    dynamic_evidence: bool,
+    min_evidence_k: int,
+    max_evidence_k: int,
+    evidence_score_threshold: float,
     evidence_source_chunks: int,
     evidence_max_chars: int,
 ) -> list[str]:
@@ -726,6 +801,10 @@ def select_sentence_evidence(
         question_emb: Precomputed question embedding.
         use_bge_instructions: Whether BGE prefixes are enabled.
         evidence_k: Number of evidence snippets to return.
+        dynamic_evidence: Whether to adaptively choose evidence count.
+        min_evidence_k: Minimum evidence count in adaptive mode.
+        max_evidence_k: Maximum evidence count in adaptive mode.
+        evidence_score_threshold: Adaptive normalized score threshold.
         evidence_source_chunks: Number of top chunks to mine sentences from.
         evidence_max_chars: Maximum characters per snippet.
 
@@ -752,7 +831,20 @@ def select_sentence_evidence(
         score = float(dense_score) + 0.15 * lex
         blended.append((score, sent))
 
-    ranked = [s for _, s in sorted(blended, key=lambda x: x[0], reverse=True)]
+    ranked_pairs = sorted(blended, key=lambda x: x[0], reverse=True)
+    ranked_scores = [score for score, _ in ranked_pairs]
+    ranked = [s for _, s in ranked_pairs]
+
+    if dynamic_evidence:
+        target_k = adaptive_k_from_scores(
+            ranked_scores,
+            min_k=min_evidence_k,
+            max_k=max_evidence_k,
+            threshold=evidence_score_threshold,
+        )
+    else:
+        target_k = max(1, min(evidence_k, len(ranked)))
+
     deduped: list[str] = []
     seen = set()
     for sent in ranked:
@@ -761,7 +853,7 @@ def select_sentence_evidence(
             continue
         seen.add(trimmed)
         deduped.append(trimmed)
-        if len(deduped) >= evidence_k:
+        if len(deduped) >= target_k:
             break
     return deduped
 
@@ -791,8 +883,15 @@ def run_pipeline(config: TrainConfig) -> tuple[list[dict], list[dict]]:
     if not isinstance(dataset, list):
         raise ValueError("Input dataset must be a list of objects.")
 
-    evidence_k = max(1, min(40, config.evidence_k))
-    retrieval_k = max(evidence_k, config.retrieval_k)
+    fixed_evidence_k = max(1, min(40, config.evidence_k))
+    min_evidence_k = max(1, min(40, config.min_evidence_k))
+    max_evidence_k = max(1, min(40, config.max_evidence_k))
+    if max_evidence_k < min_evidence_k:
+        max_evidence_k = min_evidence_k
+
+    evidence_threshold = max(0.0, min(1.0, config.evidence_score_threshold))
+    target_max_for_retrieval = max_evidence_k if config.dynamic_evidence else fixed_evidence_k
+    retrieval_k = max(target_max_for_retrieval, config.retrieval_k)
 
     console.print(f"[bold]Loading embedding model:[/bold] {config.embedding_model}")
     embedder = SentenceTransformer(config.embedding_model)
@@ -861,6 +960,7 @@ def run_pipeline(config: TrainConfig) -> tuple[list[dict], list[dict]]:
             fused = reciprocal_rank_fusion([dense_rank, sparse_rank], rrf_k=config.rrf_k)
             candidate_idx = topn_indices(fused, n=min(retrieval_k, len(chunks)))
 
+            ranked_chunk_pairs: list[tuple[int, float]]
             if reranker is not None and candidate_idx:
                 pairs = [[question, chunks[i].text] for i in candidate_idx]
                 rerank_scores = reranker.predict(pairs)
@@ -869,9 +969,22 @@ def run_pipeline(config: TrainConfig) -> tuple[list[dict], list[dict]]:
                     key=lambda x: float(x[1]),
                     reverse=True,
                 )
-                final_idx = [i for i, _ in reranked[:evidence_k]]
+                ranked_chunk_pairs = [(i, float(score)) for i, score in reranked]
             else:
-                final_idx = candidate_idx[:evidence_k]
+                ranked_chunk_pairs = [(i, float(fused.get(i, 0.0))) for i in candidate_idx]
+
+            ranked_chunk_scores = [score for _, score in ranked_chunk_pairs]
+            if config.dynamic_evidence:
+                selected_k = adaptive_k_from_scores(
+                    ranked_chunk_scores,
+                    min_k=min_evidence_k,
+                    max_k=max_evidence_k,
+                    threshold=evidence_threshold,
+                )
+            else:
+                selected_k = min(fixed_evidence_k, len(ranked_chunk_pairs))
+
+            final_idx = [i for i, _ in ranked_chunk_pairs[:selected_k]]
 
             if config.evidence_mode == "sentence":
                 sentence_evidence = select_sentence_evidence(
@@ -881,13 +994,20 @@ def run_pipeline(config: TrainConfig) -> tuple[list[dict], list[dict]]:
                     embedder=embedder,
                     question_emb=query_emb,
                     use_bge_instructions=config.use_bge_instructions,
-                    evidence_k=evidence_k,
+                    evidence_k=fixed_evidence_k,
+                    dynamic_evidence=config.dynamic_evidence,
+                    min_evidence_k=min_evidence_k,
+                    max_evidence_k=max_evidence_k,
+                    evidence_score_threshold=evidence_threshold,
                     evidence_source_chunks=config.evidence_source_chunks,
                     evidence_max_chars=config.evidence_max_chars,
                 )
-                evidence = ensure_evidence_count(sentence_evidence, k=evidence_k)
+                # Hard cap by adaptive/fixed chunk selection target while preserving rule 1<=k<=40.
+                target_k_for_output = selected_k if config.dynamic_evidence else fixed_evidence_k
+                evidence = ensure_evidence_count(sentence_evidence, k=target_k_for_output)
             else:
-                evidence = ensure_evidence_count([chunks[i].text for i in final_idx], k=evidence_k)
+                target_k_for_output = selected_k if config.dynamic_evidence else fixed_evidence_k
+                evidence = ensure_evidence_count([chunks[i].text for i in final_idx], k=target_k_for_output)
             prompt = make_answer_prompt(title=title, question=question, evidence_texts=evidence)
 
             llm_error = False
@@ -913,17 +1033,20 @@ def run_pipeline(config: TrainConfig) -> tuple[list[dict], list[dict]]:
             per_item_stats.append(
                 {
                     "title": title,
-                        "num_chunks": len(chunks),
-                        "num_candidates": len(candidate_idx),
-                        "num_evidence": len(evidence),
-                        "evidence_mode": config.evidence_mode,
-                        "source_chunk_topn": min(
-                            len(final_idx if final_idx else candidate_idx),
-                            config.evidence_source_chunks,
-                        ),
-                        "llm_error": llm_error,
-                        "answer_chars": len(answer),
-                    }
+                    "num_chunks": len(chunks),
+                    "num_candidates": len(candidate_idx),
+                    "selected_k": selected_k,
+                    "num_evidence": len(evidence),
+                    "dynamic_evidence": config.dynamic_evidence,
+                    "evidence_threshold": evidence_threshold,
+                    "evidence_mode": config.evidence_mode,
+                    "source_chunk_topn": min(
+                        len(final_idx if final_idx else candidate_idx),
+                        config.evidence_source_chunks,
+                    ),
+                    "llm_error": llm_error,
+                    "answer_chars": len(answer),
+                }
             )
             progress.advance(task)
     return outputs, per_item_stats
