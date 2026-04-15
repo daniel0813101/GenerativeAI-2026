@@ -48,11 +48,15 @@ class TrainConfig:
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     disable_rerank: bool = False
-    chunk_size: int = 1000
-    chunk_overlap: int = 140
-    retrieval_k: int = 18
-    evidence_k: int = 6
+    chunk_size: int = 700
+    chunk_overlap: int = 100
+    retrieval_k: int = 14
+    evidence_k: int = 3
     rrf_k: int = 60
+    use_bge_instructions: bool = True
+    evidence_mode: str = "sentence"
+    evidence_source_chunks: int = 4
+    evidence_max_chars: int = 320
     ollama_base_url: str = "http://127.0.0.1:11434"
     llm_model: str = "llama3.2:3b"
     llm_temperature: float = 0.2
@@ -127,6 +131,31 @@ class TrainConfig:
             help="Evidence chunks to submit per question (1-40)",
         )
         parser.add_argument("--rrf-k", type=int, default=defaults.rrf_k, help="RRF constant for rank fusion")
+        parser.add_argument(
+            "--use-bge-instructions",
+            action=argparse.BooleanOptionalAction,
+            default=defaults.use_bge_instructions,
+            help="Use BGE query/passage instruction prefixes for embeddings",
+        )
+        parser.add_argument(
+            "--evidence-mode",
+            type=str,
+            choices=("chunk", "sentence"),
+            default=defaults.evidence_mode,
+            help="Evidence output mode",
+        )
+        parser.add_argument(
+            "--evidence-source-chunks",
+            type=int,
+            default=defaults.evidence_source_chunks,
+            help="How many top chunks to mine snippets from when evidence-mode=sentence",
+        )
+        parser.add_argument(
+            "--evidence-max-chars",
+            type=int,
+            default=defaults.evidence_max_chars,
+            help="Max characters per evidence snippet",
+        )
         parser.add_argument(
             "--ollama-base-url",
             type=str,
@@ -591,6 +620,152 @@ def ensure_evidence_count(evidence: list[str], k: int) -> list[str]:
     return dedup[:k]
 
 
+def apply_bge_query_prefix(question: str, use_bge_instructions: bool) -> str:
+    """Apply BGE query instruction prefix when enabled.
+
+    Args:
+        question: Original question text.
+        use_bge_instructions: Whether to add BGE-specific instruction prefix.
+
+    Returns:
+        str: Query text used for embedding.
+    """
+    q = normalize_spaces(question)
+    if not use_bge_instructions:
+        return q
+    return f"Represent this question for retrieving relevant passages: {q}"
+
+
+def apply_bge_passage_prefix(texts: Sequence[str], use_bge_instructions: bool) -> list[str]:
+    """Apply BGE passage prefix for document-side embeddings when enabled.
+
+    Args:
+        texts: Chunk or sentence texts.
+        use_bge_instructions: Whether to add passage prefix.
+
+    Returns:
+        list[str]: Texts ready for embedding.
+    """
+    if not use_bge_instructions:
+        return [normalize_spaces(t) for t in texts]
+    return [f"passage: {normalize_spaces(t)}" for t in texts]
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split text into candidate evidence sentences.
+
+    Args:
+        text: Input text.
+
+    Returns:
+        list[str]: Sentence-like units with light filtering.
+    """
+    pieces = re.split(r"(?<=[.!?])\s+|\n+", text)
+    result: list[str] = []
+    for piece in pieces:
+        s = normalize_spaces(piece)
+        if len(s) < 25:
+            continue
+        result.append(s)
+    return result
+
+
+def lexical_overlap_score(sentence: str, question_tokens: Sequence[str]) -> float:
+    """Compute a simple lexical overlap score for one sentence.
+
+    Args:
+        sentence: Candidate sentence.
+        question_tokens: Tokenized question.
+
+    Returns:
+        float: Overlap score in [0, 1].
+    """
+    if not question_tokens:
+        return 0.0
+    sent_tokens = set(tokenize(sentence))
+    if not sent_tokens:
+        return 0.0
+    q_set = set(question_tokens)
+    return len(sent_tokens.intersection(q_set)) / len(q_set)
+
+
+def trim_evidence_length(text: str, max_chars: int) -> str:
+    """Trim evidence text to a maximum character count.
+
+    Args:
+        text: Evidence text.
+        max_chars: Character limit.
+
+    Returns:
+        str: Trimmed text.
+    """
+    text = normalize_spaces(text)
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + " ..."
+
+
+def select_sentence_evidence(
+    question: str,
+    chunks: Sequence[Chunk],
+    chunk_indices: Sequence[int],
+    embedder: SentenceTransformer,
+    question_emb: np.ndarray,
+    use_bge_instructions: bool,
+    evidence_k: int,
+    evidence_source_chunks: int,
+    evidence_max_chars: int,
+) -> list[str]:
+    """Select sentence-level evidence from top-ranked chunks.
+
+    Args:
+        question: Original question text.
+        chunks: All chunks in the current paper.
+        chunk_indices: Ranked chunk indices.
+        embedder: Embedding model for sentence scoring.
+        question_emb: Precomputed question embedding.
+        use_bge_instructions: Whether BGE prefixes are enabled.
+        evidence_k: Number of evidence snippets to return.
+        evidence_source_chunks: Number of top chunks to mine sentences from.
+        evidence_max_chars: Maximum characters per snippet.
+
+    Returns:
+        list[str]: Ranked sentence-level evidence snippets.
+    """
+    source_count = max(1, min(len(chunk_indices), evidence_source_chunks))
+    source_indices = list(chunk_indices[:source_count])
+
+    candidates: list[str] = []
+    for idx in source_indices:
+        candidates.extend(split_sentences(chunks[idx].text))
+    if not candidates:
+        return []
+
+    sent_inputs = apply_bge_passage_prefix(candidates, use_bge_instructions)
+    sent_emb = embedder.encode(sent_inputs, normalize_embeddings=True, convert_to_numpy=True)
+    dense_scores = sent_emb @ question_emb
+    q_tokens = tokenize(question)
+
+    blended: list[tuple[float, str]] = []
+    for sent, dense_score in zip(candidates, dense_scores):
+        lex = lexical_overlap_score(sent, q_tokens)
+        score = float(dense_score) + 0.15 * lex
+        blended.append((score, sent))
+
+    ranked = [s for _, s in sorted(blended, key=lambda x: x[0], reverse=True)]
+    deduped: list[str] = []
+    seen = set()
+    for sent in ranked:
+        trimmed = trim_evidence_length(sent, evidence_max_chars)
+        if trimmed in seen:
+            continue
+        seen.add(trimmed)
+        deduped.append(trimmed)
+        if len(deduped) >= evidence_k:
+            break
+    return deduped
+
+
 def run_pipeline(config: TrainConfig) -> tuple[list[dict], list[dict]]:
     """Run end-to-end RAG inference on a dataset file.
 
@@ -672,8 +847,10 @@ def run_pipeline(config: TrainConfig) -> tuple[list[dict], list[dict]]:
                 continue
 
             chunk_texts = [c.text for c in chunks]
-            doc_emb = embedder.encode(chunk_texts, normalize_embeddings=True, convert_to_numpy=True)
-            query_emb = embedder.encode([question], normalize_embeddings=True, convert_to_numpy=True)[0]
+            doc_inputs = apply_bge_passage_prefix(chunk_texts, config.use_bge_instructions)
+            query_input = apply_bge_query_prefix(question, config.use_bge_instructions)
+            doc_emb = embedder.encode(doc_inputs, normalize_embeddings=True, convert_to_numpy=True)
+            query_emb = embedder.encode([query_input], normalize_embeddings=True, convert_to_numpy=True)[0]
             dense_scores = doc_emb @ query_emb
             dense_rank = argsort_desc(dense_scores)
 
@@ -696,7 +873,21 @@ def run_pipeline(config: TrainConfig) -> tuple[list[dict], list[dict]]:
             else:
                 final_idx = candidate_idx[:evidence_k]
 
-            evidence = ensure_evidence_count([chunks[i].text for i in final_idx], k=evidence_k)
+            if config.evidence_mode == "sentence":
+                sentence_evidence = select_sentence_evidence(
+                    question=question,
+                    chunks=chunks,
+                    chunk_indices=final_idx if final_idx else candidate_idx,
+                    embedder=embedder,
+                    question_emb=query_emb,
+                    use_bge_instructions=config.use_bge_instructions,
+                    evidence_k=evidence_k,
+                    evidence_source_chunks=config.evidence_source_chunks,
+                    evidence_max_chars=config.evidence_max_chars,
+                )
+                evidence = ensure_evidence_count(sentence_evidence, k=evidence_k)
+            else:
+                evidence = ensure_evidence_count([chunks[i].text for i in final_idx], k=evidence_k)
             prompt = make_answer_prompt(title=title, question=question, evidence_texts=evidence)
 
             llm_error = False
@@ -722,12 +913,17 @@ def run_pipeline(config: TrainConfig) -> tuple[list[dict], list[dict]]:
             per_item_stats.append(
                 {
                     "title": title,
-                    "num_chunks": len(chunks),
-                    "num_candidates": len(candidate_idx),
-                    "num_evidence": len(evidence),
-                    "llm_error": llm_error,
-                    "answer_chars": len(answer),
-                }
+                        "num_chunks": len(chunks),
+                        "num_candidates": len(candidate_idx),
+                        "num_evidence": len(evidence),
+                        "evidence_mode": config.evidence_mode,
+                        "source_chunk_topn": min(
+                            len(final_idx if final_idx else candidate_idx),
+                            config.evidence_source_chunks,
+                        ),
+                        "llm_error": llm_error,
+                        "answer_chars": len(answer),
+                    }
             )
             progress.advance(task)
     return outputs, per_item_stats
