@@ -10,8 +10,8 @@ Compare your pipeline output against the public dataset ground truth.
 
 Usage:
   python score_public.py results.json
-  python score_public.py results.json --port 8091
-  python score_public.py results.json --port 8091 --host 192.168.0.7
+  python score_public.py results.json --port 11434
+  python score_public.py results.json --port 11434 --host 127.0.0.1 --model llama3.2:3b
 
 Input JSON format (same as submission):
   [{"title": "...", "answer": "...", "evidence": [...]}, ...]
@@ -27,9 +27,7 @@ import re
 import sys
 from pathlib import Path
 
-from langchain_community.llms.vllm import VLLMOpenAI
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import PromptTemplate
+from langchain_ollama import ChatOllama
 from rouge_score import rouge_scorer
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -37,14 +35,19 @@ from rouge_score import rouge_scorer
 # ──────────────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="Self-score HW2 results on the public dataset")
 parser.add_argument("results",  type=str,                                        help="Path to your results JSON.")
-parser.add_argument("--host",   type=str, default="localhost",                   help="LLM server host. Default: localhost")
-parser.add_argument("--port",   type=int, default=8091,                          help="LLM API port (same server used for RAG). Default: 8091")
-parser.add_argument("--model",  type=str, default="meta-llama/Llama-3.2-3B-Instruct", help="LLM model name.")
-parser.add_argument("--dataset",type=str, default="datasets/public_dataset.json",help="Path to the public dataset JSON.")
+parser.add_argument("--host",   type=str, default="127.0.0.1",                   help="Ollama host. Default: 127.0.0.1")
+parser.add_argument("--port",   type=int, default=11434,                         help="Ollama port. Default: 11434")
+parser.add_argument("--model",  type=str, default="llama3.2:3b",                 help="Ollama model name.")
+parser.add_argument(
+  "--dataset",
+  type=str,
+  default=str(Path(__file__).resolve().parent / "dataset" / "public_dataset.json"),
+  help="Path to the public dataset JSON.",
+)
 parser.add_argument("--times",  type=int, default=5,                             help="Judge runs per paper (majority vote). Default: 5")
 args = parser.parse_args()
 
-LLM_ENDPOINT = f"http://{args.host}:{args.port}/v1"
+LLM_ENDPOINT = f"http://{args.host}:{args.port}"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Evidence Score — ROUGE-L (identical to TA grading)
@@ -89,17 +92,12 @@ _JUDGE_TEMPLATE = (
   "assistant: The score is "
 )
 
-_llm = VLLMOpenAI(
+_llm = ChatOllama(
   base_url=LLM_ENDPOINT,
-  api_key="abc",
   model=args.model,
   temperature=0.6,
-  max_tokens=1,
-  frequency_penalty=1.6, 
-  presence_penalty=0.8,
-  model_kwargs={"stop": ["```", "}}"]},
+  num_predict=8,
 )
-_judge_chain = PromptTemplate.from_template(_JUDGE_TEMPLATE) | _llm | StrOutputParser()
 
 _IDK_RE = re.compile(
   r"i (don'?t|do not|cannot|can'?t) know"
@@ -117,6 +115,28 @@ def _extract_score(text: str) -> float:
   m = re.search(r"([01])\s*$", text.strip())
   return float(m.group(1)) if m else 0.0
 
+def _to_text(content: object) -> str:
+  """Normalize ChatOllama outputs to plain text."""
+  if hasattr(content, "content"):
+    raw = getattr(content, "content")
+    if isinstance(raw, str):
+      return raw.strip()
+    if isinstance(raw, list):
+      parts: list[str] = []
+      for item in raw:
+        if isinstance(item, str):
+          parts.append(item)
+        elif isinstance(item, dict) and "text" in item:
+          parts.append(str(item["text"]))
+      return " ".join(parts).strip()
+  return str(content).strip()
+
+def _as_answer_text(answer: object) -> str:
+  """Convert ground-truth answer object to a plain string."""
+  if isinstance(answer, list):
+    return " ".join(str(x) for x in answer)
+  return str(answer)
+
 def judge_correctness(
   title: str,
   question: str,
@@ -126,6 +146,7 @@ def judge_correctness(
   times: int = 3,
 ) -> float:
   """Run judge `times` times and return majority-vote score (0.0 or 1.0)."""
+  prediction = str(prediction)
   if not prediction.strip() or prediction in {"N/A", "n/a", "None", "Answer:"}:
     return 0.0
   if _IDK_RE.search(prediction):
@@ -133,13 +154,14 @@ def judge_correctness(
   query = {
     "document":   f"Paper title: {title}\n" + "\n".join(gt_evidence),
     "question":   question,
-    "answer":     " ".join(gt_answer),
+    "answer":     _as_answer_text(gt_answer),
     "prediction": prediction,
   }
   scores: list[float] = []
   for _ in range(times):
     try:
-      raw = _judge_chain.invoke(query)
+      prompt = _JUDGE_TEMPLATE.format(**query)
+      raw = _to_text(_llm.invoke(prompt))
       scores.append(_extract_score(raw))
     except Exception as exc:
       print(f"  [judge error: {exc}]", file=sys.stderr)
