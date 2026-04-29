@@ -128,20 +128,16 @@ class PromptBuilder:
         with open(classes_path, encoding="utf-8") as f:
             raw = json.load(f)
 
-        # Support both list[{id,name,description}] and dict formats
-        if isinstance(raw, list):
-            self.classes = raw
-        else:
-            self.classes = [
-                {"id": v["id"], "name": k, "description": v.get("description", "")}
-                for k, v in raw.items()
-            ]
+        self.classes = raw if isinstance(raw, list) else [
+            {"id": v["id"], "concept": k, "concept_desc": v.get("concept_desc", "")}
+            for k, v in raw.items()
+        ]
 
-        self.id_to_name: Dict[int, str] = {c["id"]: c["name"] for c in self.classes}
-        self.name_to_id: Dict[str, int] = {c["name"]: c["id"] for c in self.classes}
+        self.id_to_name: Dict[int, str] = {c["id"]: c["concept"] for c in self.classes}
+        self.name_to_id: Dict[str, int] = {c["concept"]: c["id"] for c in self.classes}
 
         class_block = "\n".join(
-            f"- {c['name']}: {c.get('description', '')}" for c in self.classes
+            f"- {c['concept']}: {c.get('concept_desc', '')}" for c in self.classes
         )
         self._system = _SYSTEM_TEMPLATE.format(class_block=class_block)
 
@@ -172,9 +168,9 @@ class OutputParser:
         with open(classes_path, encoding="utf-8") as f:
             raw = json.load(f)
         classes = raw if isinstance(raw, list) else [
-            {"id": v["id"], "name": k} for k, v in raw.items()
+            {"id": v["id"], "concept": k} for k, v in raw.items()
         ]
-        self.name_to_id: Dict[str, int] = {c["name"]: c["id"] for c in classes}
+        self.name_to_id: Dict[str, int] = {c["concept"]: c["id"] for c in classes}
         self.names = list(self.name_to_id)
         self._default_id: int = classes[0]["id"]
 
