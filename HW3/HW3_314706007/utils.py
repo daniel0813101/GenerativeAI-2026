@@ -13,6 +13,21 @@ import pandas as pd
 import torch
 
 
+# ── PDF path resolution ───────────────────────────────────────────────────────
+
+def find_pdf(pdf_dir: Path, paper_id: str) -> Path:
+    """Search flat layout and train/dev/test subfolders for a paper PDF."""
+    for candidate in [
+        pdf_dir / f"{paper_id}.pdf",
+        pdf_dir / "train" / f"{paper_id}.pdf",
+        pdf_dir / "dev"   / f"{paper_id}.pdf",
+        pdf_dir / "test"  / f"{paper_id}.pdf",
+    ]:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"PDF for '{paper_id}' not found under {pdf_dir}")
+
+
 # ── Reproducibility ───────────────────────────────────────────────────────────
 
 def set_seed(seed: int) -> None:
@@ -64,9 +79,10 @@ class PDFParser:
         pdf_dir = Path(pdf_dir)
         from tqdm import tqdm
         for pid in tqdm(paper_ids, desc="Parsing PDFs"):
-            pdf_path = pdf_dir / f"{pid}.pdf"
-            if pdf_path.exists():
-                self.parse(pid, pdf_path)
+            try:
+                self.parse(pid, find_pdf(pdf_dir, pid))
+            except FileNotFoundError:
+                pass
 
 
 # ── Evidence Retrieval ────────────────────────────────────────────────────────

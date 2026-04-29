@@ -23,6 +23,7 @@ from utils import (
     PromptBuilder,
     WeightedDataCollator,
     compute_macro_f1,
+    find_pdf,
     mask_prompt_tokens,
     oversample,
     set_seed,
@@ -111,7 +112,7 @@ def build_tokenized_dataset(
     all_weights: List[float] = []
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Tokenizing"):
-        pdf_path = pdf_dir / f"{row['paper_id']}.pdf"
+        pdf_path = find_pdf(pdf_dir, str(row["paper_id"]))
         raw_text = parser.parse(str(row["paper_id"]), pdf_path)
         chunks = parser.chunk(raw_text)
         evidence = retriever.retrieve(row["text"], str(row["paper_id"]), chunks)
@@ -161,7 +162,7 @@ def evaluate_dev(
     predictions: List[int] = []
 
     for _, row in tqdm(dev_df.iterrows(), total=len(dev_df), desc="Dev eval"):
-        pdf_path = pdf_dir / f"{row['paper_id']}.pdf"
+        pdf_path = find_pdf(pdf_dir, str(row["paper_id"]))
         raw_text = parser.parse(str(row["paper_id"]), pdf_path)
         chunks = parser.chunk(raw_text)
         evidence = retriever.retrieve(row["text"], str(row["paper_id"]), chunks)

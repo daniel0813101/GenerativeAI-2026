@@ -16,6 +16,7 @@ from utils import (
     PDFParser,
     PromptBuilder,
     compute_macro_f1,
+    find_pdf,
     set_seed,
 )
 
@@ -50,7 +51,7 @@ def run_inference(
     predictions: List[int] = []
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Inference"):
-        pdf_path = pdf_dir / f"{row['paper_id']}.pdf"
+        pdf_path = find_pdf(pdf_dir, str(row["paper_id"]))
         raw_text = parser.parse(str(row["paper_id"]), pdf_path)
         chunks = parser.chunk(raw_text)
         evidence = retriever.retrieve(row["text"], str(row["paper_id"]), chunks)
