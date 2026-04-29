@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import logging
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import List
@@ -16,6 +18,7 @@ from utils import (
     PDFParser,
     PromptBuilder,
     compute_macro_f1,
+    find_pdf,
     set_seed,
 )
 
@@ -24,7 +27,7 @@ from utils import (
 
 @dataclass
 class InferenceConfig:
-    data_dir: str = "../data"
+    data_dir: str = "../dataset"
     adapter_dir: str = "adapter_checkpoint"
     cache_dir: str = "paper_cache"
     output_csv: str = "hw3_314706007.csv"
@@ -50,7 +53,7 @@ def run_inference(
     predictions: List[int] = []
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Inference"):
-        pdf_path = pdf_dir / f"{row['paper_id']}.pdf"
+        pdf_path = find_pdf(pdf_dir, str(row["paper_id"]))
         raw_text = parser.parse(str(row["paper_id"]), pdf_path)
         chunks = parser.chunk(raw_text)
         evidence = retriever.retrieve(row["text"], str(row["paper_id"]), chunks)

@@ -13,6 +13,21 @@ import pandas as pd
 import torch
 
 
+# ── PDF path resolution ───────────────────────────────────────────────────────
+
+def find_pdf(pdf_dir: Path, paper_id: str) -> Path:
+    """Search flat layout and train/dev/test subfolders for a paper PDF."""
+    for candidate in [
+        pdf_dir / f"{paper_id}.pdf",
+        pdf_dir / "train" / f"{paper_id}.pdf",
+        pdf_dir / "dev"   / f"{paper_id}.pdf",
+        pdf_dir / "test"  / f"{paper_id}.pdf",
+    ]:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"PDF for '{paper_id}' not found under {pdf_dir}")
+
+
 # ── Reproducibility ───────────────────────────────────────────────────────────
 
 def set_seed(seed: int) -> None:
@@ -64,9 +79,10 @@ class PDFParser:
         pdf_dir = Path(pdf_dir)
         from tqdm import tqdm
         for pid in tqdm(paper_ids, desc="Parsing PDFs"):
-            pdf_path = pdf_dir / f"{pid}.pdf"
-            if pdf_path.exists():
-                self.parse(pid, pdf_path)
+            try:
+                self.parse(pid, find_pdf(pdf_dir, pid))
+            except FileNotFoundError:
+                pass
 
 
 # ── Evidence Retrieval ────────────────────────────────────────────────────────
@@ -128,20 +144,16 @@ class PromptBuilder:
         with open(classes_path, encoding="utf-8") as f:
             raw = json.load(f)
 
-        # Support both list[{id,name,description}] and dict formats
-        if isinstance(raw, list):
-            self.classes = raw
-        else:
-            self.classes = [
-                {"id": v["id"], "name": k, "description": v.get("description", "")}
-                for k, v in raw.items()
-            ]
+        self.classes = raw if isinstance(raw, list) else [
+            {"id": v["id"], "concept": k, "concept_desc": v.get("concept_desc", "")}
+            for k, v in raw.items()
+        ]
 
-        self.id_to_name: Dict[int, str] = {c["id"]: c["name"] for c in self.classes}
-        self.name_to_id: Dict[str, int] = {c["name"]: c["id"] for c in self.classes}
+        self.id_to_name: Dict[int, str] = {c["id"]: c["concept"] for c in self.classes}
+        self.name_to_id: Dict[str, int] = {c["concept"]: c["id"] for c in self.classes}
 
         class_block = "\n".join(
-            f"- {c['name']}: {c.get('description', '')}" for c in self.classes
+            f"- {c['concept']}: {c.get('concept_desc', '')}" for c in self.classes
         )
         self._system = _SYSTEM_TEMPLATE.format(class_block=class_block)
 
@@ -172,9 +184,9 @@ class OutputParser:
         with open(classes_path, encoding="utf-8") as f:
             raw = json.load(f)
         classes = raw if isinstance(raw, list) else [
-            {"id": v["id"], "name": k} for k, v in raw.items()
+            {"id": v["id"], "concept": k} for k, v in raw.items()
         ]
-        self.name_to_id: Dict[str, int] = {c["name"]: c["id"] for c in classes}
+        self.name_to_id: Dict[str, int] = {c["concept"]: c["id"] for c in classes}
         self.names = list(self.name_to_id)
         self._default_id: int = classes[0]["id"]
 
@@ -255,17 +267,23 @@ class WeightedDataCollator:
     def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
         weights = [float(f.pop("sample_weight", 1.0)) for f in features]
 
+        # Extract labels before passing to tokenizer.pad — it only handles
+        # input_ids / attention_mask and will error on variable-length label lists.
+        labels_list = [f.pop("labels") for f in features]
+
         batch = self.tokenizer.pad(
             features,
             padding=True,
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors="pt",
         )
-        # tokenizer.pad fills labels with pad_token_id; replace with -100
-        if "labels" in batch:
-            batch["labels"] = batch["labels"].masked_fill(
-                batch["labels"] == self.tokenizer.pad_token_id, -100
-            )
+
+        # Right-pad labels with -100 to match the padded input length
+        max_len = batch["input_ids"].shape[1]
+        padded_labels = [
+            lbl + [-100] * (max_len - len(lbl)) for lbl in labels_list
+        ]
+        batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
         batch["sample_weights"] = torch.tensor(weights, dtype=torch.float32)
         return batch
 

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import unsloth
+
 import argparse
+import logging
+import os
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
 import json
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -23,6 +28,7 @@ from utils import (
     PromptBuilder,
     WeightedDataCollator,
     compute_macro_f1,
+    find_pdf,
     mask_prompt_tokens,
     oversample,
     set_seed,
@@ -34,7 +40,7 @@ from utils import (
 @dataclass
 class TrainingConfig:
     model_name: str = "unsloth/Qwen2.5-3B-Instruct-bnb-4bit"
-    data_dir: str = "../data"
+    data_dir: str = "../dataset"
     adapter_dir: str = "adapter_checkpoint"
     cache_dir: str = "paper_cache"
     max_seq_len: int = 2048
@@ -111,7 +117,7 @@ def build_tokenized_dataset(
     all_weights: List[float] = []
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Tokenizing"):
-        pdf_path = pdf_dir / f"{row['paper_id']}.pdf"
+        pdf_path = find_pdf(pdf_dir, str(row["paper_id"]))
         raw_text = parser.parse(str(row["paper_id"]), pdf_path)
         chunks = parser.chunk(raw_text)
         evidence = retriever.retrieve(row["text"], str(row["paper_id"]), chunks)
@@ -161,7 +167,7 @@ def evaluate_dev(
     predictions: List[int] = []
 
     for _, row in tqdm(dev_df.iterrows(), total=len(dev_df), desc="Dev eval"):
-        pdf_path = pdf_dir / f"{row['paper_id']}.pdf"
+        pdf_path = find_pdf(pdf_dir, str(row["paper_id"]))
         raw_text = parser.parse(str(row["paper_id"]), pdf_path)
         chunks = parser.chunk(raw_text)
         evidence = retriever.retrieve(row["text"], str(row["paper_id"]), chunks)
@@ -267,6 +273,7 @@ def main(config: TrainingConfig) -> None:
         train_dataset=train_dataset,
         data_collator=collator,
     )
+    os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
     trainer.train()
 
     dev_path = data_dir / "dev.csv"
