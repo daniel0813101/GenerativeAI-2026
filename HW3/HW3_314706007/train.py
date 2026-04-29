@@ -4,6 +4,7 @@ import unsloth
 
 import argparse
 import logging
+import os
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 import json
 from dataclasses import asdict, dataclass, field, fields
@@ -272,6 +273,7 @@ def main(config: TrainingConfig) -> None:
         train_dataset=train_dataset,
         data_collator=collator,
     )
+    os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
     trainer.train()
 
     dev_path = data_dir / "dev.csv"
