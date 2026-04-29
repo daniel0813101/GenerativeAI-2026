@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import logging
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import List

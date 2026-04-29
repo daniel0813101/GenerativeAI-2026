@@ -3,6 +3,8 @@ from __future__ import annotations
 import unsloth
 
 import argparse
+import logging
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
 import json
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
