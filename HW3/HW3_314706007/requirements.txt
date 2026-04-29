@@ -1,0 +1,23 @@
+# Core ML — install unsloth first to get the patched transformers
+unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+transformers>=4.40.0
+trl>=0.8.0
+peft>=0.10.0
+bitsandbytes>=0.43.0
+accelerate>=0.28.0
+
+# Dataset
+datasets>=2.18.0
+
+# PDF parsing (pdfplumber preferred; PyPDF2 used as fallback)
+pdfplumber>=0.10.0
+PyPDF2>=3.0.0
+
+# BM25 retrieval
+rank-bm25>=0.2.2
+
+# Data / evaluation
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+tqdm>=4.66.0
