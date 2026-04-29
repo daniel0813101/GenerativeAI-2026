@@ -267,17 +267,23 @@ class WeightedDataCollator:
     def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
         weights = [float(f.pop("sample_weight", 1.0)) for f in features]
 
+        # Extract labels before passing to tokenizer.pad — it only handles
+        # input_ids / attention_mask and will error on variable-length label lists.
+        labels_list = [f.pop("labels") for f in features]
+
         batch = self.tokenizer.pad(
             features,
             padding=True,
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors="pt",
         )
-        # tokenizer.pad fills labels with pad_token_id; replace with -100
-        if "labels" in batch:
-            batch["labels"] = batch["labels"].masked_fill(
-                batch["labels"] == self.tokenizer.pad_token_id, -100
-            )
+
+        # Right-pad labels with -100 to match the padded input length
+        max_len = batch["input_ids"].shape[1]
+        padded_labels = [
+            lbl + [-100] * (max_len - len(lbl)) for lbl in labels_list
+        ]
+        batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
         batch["sample_weights"] = torch.tensor(weights, dtype=torch.float32)
         return batch
 
