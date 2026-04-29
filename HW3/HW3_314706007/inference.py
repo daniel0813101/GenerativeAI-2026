@@ -25,7 +25,7 @@ from utils import (
 
 @dataclass
 class InferenceConfig:
-    data_dir: str = "../data"
+    data_dir: str = "../dataset"
     adapter_dir: str = "adapter_checkpoint"
     cache_dir: str = "paper_cache"
     output_csv: str = "hw3_314706007.csv"

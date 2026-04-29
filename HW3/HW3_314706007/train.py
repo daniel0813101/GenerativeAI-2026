@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import unsloth
+
 import argparse
 import json
 from dataclasses import asdict, dataclass, field, fields
@@ -35,7 +37,7 @@ from utils import (
 @dataclass
 class TrainingConfig:
     model_name: str = "unsloth/Qwen2.5-3B-Instruct-bnb-4bit"
-    data_dir: str = "../data"
+    data_dir: str = "../dataset"
     adapter_dir: str = "adapter_checkpoint"
     cache_dir: str = "paper_cache"
     max_seq_len: int = 2048
