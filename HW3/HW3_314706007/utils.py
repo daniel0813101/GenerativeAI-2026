@@ -89,9 +89,13 @@ class PDFParser:
 # ── Evidence Retrieval ────────────────────────────────────────────────────────
 
 class EvidenceRetriever:
-    """BM25-based retrieval of the most relevant paper chunks for a query."""
+    """BM25-based retrieval of the most relevant paper chunks for a query.
 
-    def __init__(self, top_k: int = 5, max_tokens: int = 1500):
+    Budget is measured in whitespace-separated words. Note that BPE tokenizers
+    typically expand academic text 1.5-3x, so 1000 words ≈ 1500-3000 BPE tokens.
+    """
+
+    def __init__(self, top_k: int = 5, max_tokens: int = 600):
         self.top_k = top_k
         self.max_tokens = max_tokens
         self._index: Dict[str, tuple] = {}
@@ -113,13 +117,23 @@ class EvidenceRetriever:
 
         selected, token_count = [], 0
         for i in top_idx:
-            n = len(stored_chunks[i].split())
+            words = stored_chunks[i].split()
+            n = len(words)
             if token_count + n > self.max_tokens:
+                # Pack a truncated tail into the remaining budget if substantial
+                remaining = self.max_tokens - token_count
+                if remaining >= 50:
+                    selected.append(" ".join(words[:remaining]))
                 break
             selected.append(stored_chunks[i])
             token_count += n
 
-        return "\n\n".join(selected) if selected else stored_chunks[0]
+        if not selected:
+            # The top-scoring chunk alone exceeds budget; truncate it.
+            top_words = stored_chunks[top_idx[0]].split()
+            selected.append(" ".join(top_words[: self.max_tokens]))
+
+        return "\n\n".join(selected)
 
 
 # ── Prompt Building ───────────────────────────────────────────────────────────

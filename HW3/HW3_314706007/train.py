@@ -9,8 +9,7 @@ import os
 import warnings
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", message="Both `max_new_tokens`.*and `max_length`")
-import json
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Dict, List
 
@@ -46,7 +45,7 @@ class TrainingConfig:
     data_dir: str = "../dataset"
     adapter_dir: str = "adapter_checkpoint"
     cache_dir: str = "paper_cache"
-    max_seq_len: int = 2048
+    max_seq_len: int = 4096
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
@@ -282,7 +281,7 @@ def main(config: TrainingConfig) -> None:
     pdf_parser = PDFParser(config.cache_dir)
     pdf_parser.preprocess_all(pdf_dir, df["paper_id"].unique().tolist())
 
-    retriever = EvidenceRetriever(top_k=5, max_tokens=1500)
+    retriever = EvidenceRetriever(top_k=5, max_tokens=600)
     prompt_builder = PromptBuilder(classes_json)
 
     train_dataset = build_tokenized_dataset(

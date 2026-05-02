@@ -33,10 +33,11 @@ class InferenceConfig:
     adapter_dir: str = "adapter_checkpoint"
     cache_dir: str = "paper_cache"
     output_csv: str = "hw3_314706007.csv"
-    max_seq_len: int = 2048
+    max_seq_len: int = 4096
     max_new_tokens: int = 100
     seed: int = 42
-    dev_only: bool = False  # skip test.csv; only score dev.csv
+    dev_only: bool = False   # run dev.csv only, skip test.csv
+    test_only: bool = False  # run test.csv only, skip dev.csv
 
 
 # ── Core inference loop ───────────────────────────────────────────────────────
@@ -130,12 +131,12 @@ def main(config: InferenceConfig) -> None:
     tokenizer.padding_side = "left"
 
     pdf_parser = PDFParser(config.cache_dir)
-    retriever = EvidenceRetriever(top_k=5, max_tokens=1500)
+    retriever = EvidenceRetriever(top_k=5, max_tokens=600)
     prompt_builder = PromptBuilder(classes_json)
     output_parser = OutputParser(classes_json)
 
-    # ── Dev evaluation (only when --dev_only is set) ─────────────────────────
-    if config.dev_only:
+    # ── Dev evaluation (skipped when --test_only) ────────────────────────────
+    if not config.test_only:
         dev_df = pd.read_csv(data_dir / "dev.csv")
         dev_preds = run_inference(
             dev_df, model, tokenizer, pdf_parser, retriever,
@@ -146,7 +147,7 @@ def main(config: InferenceConfig) -> None:
         score = compute_macro_f1(dev_preds, dev_df["label"].tolist())
         print(f"Dev Macro F1: {score:.4f}")
 
-    # ── Test inference ────────────────────────────────────────────────────────
+    # ── Test inference (skipped when --dev_only) ─────────────────────────────
     if not config.dev_only:
         test_df = pd.read_csv(data_dir / "test.csv")
         preds = run_inference(
