@@ -3,9 +3,12 @@ from __future__ import annotations
 import unsloth
 
 import argparse
+from datetime import datetime
 import logging
 import os
+import warnings
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message="Both `max_new_tokens`.*and `max_length`")
 import json
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -29,8 +32,8 @@ from utils import (
     WeightedDataCollator,
     compute_macro_f1,
     find_pdf,
-    mask_prompt_tokens,
     oversample,
+    print_prediction_distribution,
     set_seed,
 )
 
@@ -52,7 +55,7 @@ class TrainingConfig:
     learning_rate: float = 2e-4
     epochs: int = 3
     warmup_ratio: float = 0.1
-    max_multiplier: int = 5
+    max_multiplier: int = 10
     seed: int = 42
 
 
@@ -107,10 +110,6 @@ def build_tokenized_dataset(
     pdf_dir: Path,
     class_weight_map: Dict[int, float],
 ) -> Dataset:
-    assistant_header_ids = tokenizer.encode(
-        "<|im_start|>assistant\n", add_special_tokens=False
-    )
-
     all_input_ids: List[List[int]] = []
     all_attention_masks: List[List[int]] = []
     all_labels: List[List[int]] = []
@@ -121,6 +120,17 @@ def build_tokenized_dataset(
         raw_text = parser.parse(str(row["paper_id"]), pdf_path)
         chunks = parser.chunk(raw_text)
         evidence = retriever.retrieve(row["text"], str(row["paper_id"]), chunks)
+
+        # Tokenize prompt-only to get exact boundary; add_generation_prompt=True
+        # appends the <|im_start|>assistant\n prefix so prompt_len covers it.
+        prompt_only = tokenizer.apply_chat_template(
+            prompt_builder.build(row["text"], evidence),
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompt_len = len(
+            tokenizer(prompt_only, truncation=False, add_special_tokens=False)["input_ids"]
+        )
 
         messages = prompt_builder.build(row["text"], evidence, label_id=int(row["label"]))
         full_text = tokenizer.apply_chat_template(
@@ -133,7 +143,27 @@ def build_tokenized_dataset(
             add_special_tokens=False,
         )
         input_ids: List[int] = tokens["input_ids"]
-        labels = mask_prompt_tokens(input_ids, assistant_header_ids)
+        labels = input_ids.copy()
+        # Mask everything up to (but not including) the answer tokens.
+        for i in range(min(prompt_len, len(labels))):
+            labels[i] = -100
+
+        # Diagnostic on first sample only — confirms masking actually works.
+        if not all_input_ids:
+            answer_ids = input_ids[prompt_len:]
+            answer_text = tokenizer.decode(answer_ids, skip_special_tokens=False)
+            unmasked = sum(1 for l in labels if l != -100)
+            print(
+                f"\n[diag] First training example:\n"
+                f"  prompt_len={prompt_len}, total_len={len(input_ids)}\n"
+                f"  unmasked label tokens={unmasked}\n"
+                f"  answer text={answer_text[:300]!r}\n"
+            )
+            if unmasked == 0:
+                raise RuntimeError(
+                    "All labels are -100 — answer was truncated away. "
+                    "Increase max_seq_len or shrink the evidence budget."
+                )
 
         all_input_ids.append(input_ids)
         all_attention_masks.append(tokens["attention_mask"])
@@ -183,15 +213,19 @@ def evaluate_dev(
         with torch.no_grad():
             out = model.generate(
                 **inputs,
-                max_new_tokens=50,
+                max_new_tokens=100,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
         new_tokens = out[0][inputs["input_ids"].shape[1] :]
         generated = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        predictions.append(output_parser.parse(generated))
+        pred = output_parser.parse(generated)
+        if len(predictions) < 5:
+            print(f"[dev {len(predictions)}] generated: {generated[:300]!r} → pred={pred}")
+        predictions.append(pred)
 
     model.train()
+    print_prediction_distribution("dev", predictions, prompt_builder.id_to_name)
     return compute_macro_f1(predictions, dev_df["label"].tolist())
 
 
@@ -200,12 +234,18 @@ def evaluate_dev(
 def main(config: TrainingConfig) -> None:
     set_seed(config.seed)
 
+    run_dir = Path(config.adapter_dir) / datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Run directory: {run_dir}")
+
     data_dir = Path(config.data_dir)
     pdf_dir = data_dir / "paper_evidence"
     classes_json = data_dir / "classes.json"
 
     df = pd.read_csv(data_dir / "train.csv")
+    print(f"[diag] Raw class distribution:\n{df['label'].value_counts().sort_index()}")
     df = oversample(df, max_multiplier=config.max_multiplier)
+    print(f"[diag] Post-oversample class distribution:\n{df['label'].value_counts().sort_index()}")
 
     unique_labels = np.unique(df["label"].values)
     raw_weights = compute_class_weight("balanced", classes=unique_labels, y=df["label"].values)
@@ -213,6 +253,7 @@ def main(config: TrainingConfig) -> None:
         int(k): float(v) for k, v in zip(unique_labels, raw_weights)
     }
 
+    os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=config.model_name,
         max_seq_length=config.max_seq_len,
@@ -236,6 +277,7 @@ def main(config: TrainingConfig) -> None:
         use_gradient_checkpointing="unsloth",
         random_state=config.seed,
     )
+    model.print_trainable_parameters()
 
     pdf_parser = PDFParser(config.cache_dir)
     pdf_parser.preprocess_all(pdf_dir, df["paper_id"].unique().tolist())
@@ -251,7 +293,7 @@ def main(config: TrainingConfig) -> None:
     collator = WeightedDataCollator(tokenizer=tokenizer)
 
     training_args = TrainingArguments(
-        output_dir=config.adapter_dir,
+        output_dir=str(run_dir),
         num_train_epochs=config.epochs,
         per_device_train_batch_size=config.batch_size,
         gradient_accumulation_steps=config.grad_accum,
@@ -273,7 +315,6 @@ def main(config: TrainingConfig) -> None:
         train_dataset=train_dataset,
         data_collator=collator,
     )
-    os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
     trainer.train()
 
     dev_path = data_dir / "dev.csv"
@@ -286,9 +327,9 @@ def main(config: TrainingConfig) -> None:
         )
         print(f"Dev Macro F1: {macro_f1:.4f}")
 
-    model.save_pretrained(config.adapter_dir)
-    tokenizer.save_pretrained(config.adapter_dir)
-    print(f"Adapter saved → {config.adapter_dir}/")
+    model.save_pretrained(run_dir)
+    tokenizer.save_pretrained(run_dir)
+    print(f"Adapter saved → {run_dir}/")
 
 
 def parse_args() -> TrainingConfig:

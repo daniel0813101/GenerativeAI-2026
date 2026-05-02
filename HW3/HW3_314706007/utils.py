@@ -4,6 +4,7 @@ import difflib
 import json
 import random
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
@@ -124,19 +125,44 @@ class EvidenceRetriever:
 # ── Prompt Building ───────────────────────────────────────────────────────────
 
 _SYSTEM_TEMPLATE = """\
-You are an expert at detecting hallucinations in AI-generated peer reviews of academic papers.
-A hallucination occurs when a review makes a claim that is incorrect, unsupported, or distorted
-relative to the actual paper content.
+You are an expert hallucination auditor for AI-generated peer reviews of academic papers.
+
+Your task: given a peer review sentence and relevant paper passages, determine which type of hallucination the review sentence contains by directly comparing the claim in the review against what the paper actually states.
 
 Hallucination types:
 {class_block}
 
-Instructions:
-1. Identify the specific claim made in the review sentence.
-2. Check whether the paper evidence supports or contradicts that claim.
-3. Choose the hallucination type that best explains the discrepancy.
-4. Output ONLY the exact class name — nothing else.\
-"""
+Reasoning steps:
+1. Identify the specific factual claim made in the review sentence.
+2. Locate the corresponding content in the paper evidence.
+3. Identify the exact discrepancy: wrong entity? wrong number? too broad? wrong tense or modality? unsupported attribution?
+4. Map the discrepancy to exactly one of the five hallucination types.
+
+Output format:
+First, write a single short sentence describing the discrepancy.
+Then end your response with exactly this line:
+The type is: <class_name>
+where <class_name> must be one of: Attribution Failure, Entity, Number, Overgeneralization, Temporal."""
+
+
+# Class-grounded reasoning templates used as the supervised CoT signal during
+# training. The model has to classify correctly to pick the right template,
+# which forces it to attend to the input.
+_REASONING_TEMPLATES: Dict[str, str] = {
+    "Attribution Failure": "The review's claim cannot be properly grounded in the paper evidence — the source is misattributed or no supporting passage exists.",
+    "Entity": "The review references a noun phrase (a name, method, dataset, or technical term) that does not match what the paper actually states.",
+    "Number": "The review states a numerical value that differs from the corresponding number in the paper.",
+    "Overgeneralization": "The review draws a conclusion that is broader or more absolute than what the paper's evidence actually supports.",
+    "Temporal": "The review misrepresents tense, modality, or time reference relative to how the paper frames the same content.",
+}
+
+
+def _assistant_response(class_name: str) -> str:
+    reasoning = _REASONING_TEMPLATES.get(
+        class_name,
+        "The review's claim does not match the paper evidence.",
+    )
+    return f"{reasoning} The type is: {class_name}"
 
 
 class PromptBuilder:
@@ -164,20 +190,24 @@ class PromptBuilder:
         label_id: int | None = None,
     ) -> List[Dict[str, str]]:
         user = (
-            f"Review sentence: {text}\n\n"
-            f"Relevant paper evidence:\n{evidence}\n\n"
-            "What type of hallucination does this review sentence contain?"
+            f"Review sentence:\n{text}\n\n"
+            f"Paper evidence:\n{evidence}\n\n"
+            "Compare the review sentence with the paper evidence above and identify the hallucination type."
         )
         messages = [
             {"role": "system", "content": self._system},
             {"role": "user", "content": user},
         ]
         if label_id is not None:
-            messages.append({"role": "assistant", "content": self.id_to_name[label_id]})
+            class_name = self.id_to_name[label_id]
+            messages.append({"role": "assistant", "content": _assistant_response(class_name)})
         return messages
 
 
 # ── Output Parsing ────────────────────────────────────────────────────────────
+
+_TYPE_LINE_RE = re.compile(r"the\s+type\s+is\s*:?\s*([^\n]+)", re.IGNORECASE)
+
 
 class OutputParser:
     def __init__(self, classes_path: str | Path):
@@ -188,22 +218,41 @@ class OutputParser:
         ]
         self.name_to_id: Dict[str, int] = {c["concept"]: c["id"] for c in classes}
         self.names = list(self.name_to_id)
+        # Longest names first — avoids "entity"/"number" matching as substrings
+        # of longer phrases in free-form output.
+        self._names_by_len = sorted(self.names, key=len, reverse=True)
         self._default_id: int = classes[0]["id"]
+
+    def _match_in(self, segment: str) -> int | None:
+        if segment in self.name_to_id:
+            return self.name_to_id[segment]
+        seg_lower = segment.lower()
+        for name in self._names_by_len:
+            if name.lower() in seg_lower:
+                return self.name_to_id[name]
+        return None
 
     def parse(self, generated: str) -> int:
         text = generated.strip()
-        # Exact match
-        if text in self.name_to_id:
-            return self.name_to_id[text]
-        # Case-insensitive substring match
-        lower = text.lower()
-        for name, cls_id in self.name_to_id.items():
-            if name.lower() in lower:
-                return cls_id
-        # Fuzzy match as last resort
+
+        # 1) Primary: extract the tail of "The type is: <class_name>"
+        match = _TYPE_LINE_RE.search(text)
+        if match:
+            tail = match.group(1).strip().rstrip(".").strip(" '\"`*")
+            hit = self._match_in(tail)
+            if hit is not None:
+                return hit
+
+        # 2) Fallback: search the whole output, longest name first
+        hit = self._match_in(text)
+        if hit is not None:
+            return hit
+
+        # 3) Fuzzy fallback for typos / casing drift
         matches = difflib.get_close_matches(text, self.names, n=1, cutoff=0.4)
         if matches:
             return self.name_to_id[matches[0]]
+
         return self._default_id
 
 
@@ -212,11 +261,16 @@ class OutputParser:
 def oversample(
     df: pd.DataFrame,
     label_col: str = "label",
-    max_multiplier: int = 5,
+    max_multiplier: int = 10,
 ) -> pd.DataFrame:
-    """Repeat minority-class rows until each class reaches min(median, count * max_multiplier)."""
+    """Repeat minority-class rows until each class reaches min(majority count, count * max_multiplier).
+
+    Targeting the majority count (instead of the median) gives a near-balanced
+    dataset. The 15:1 imbalance described in the assignment is the core
+    challenge — for Temporal (130 rows) we expand to ~1300 with multiplier=10.
+    """
     counts = df[label_col].value_counts()
-    target_count = int(counts.median())
+    target_count = int(counts.max())
 
     parts = []
     for label, count in counts.items():
@@ -232,28 +286,6 @@ def oversample(
         .sample(frac=1, random_state=42)
         .reset_index(drop=True)
     )
-
-
-# ── Tokenization helpers ──────────────────────────────────────────────────────
-
-def find_last_sublist(lst: List[int], sublist: List[int]) -> int:
-    """Return the start index of the last occurrence of sublist in lst, or -1."""
-    n = len(sublist)
-    for i in range(len(lst) - n, -1, -1):
-        if lst[i : i + n] == sublist:
-            return i
-    return -1
-
-
-def mask_prompt_tokens(input_ids: List[int], assistant_header_ids: List[int]) -> List[int]:
-    """Copy input_ids into labels and set -100 for all tokens up to and including the assistant header."""
-    labels = input_ids.copy()
-    pos = find_last_sublist(input_ids, assistant_header_ids)
-    if pos >= 0:
-        mask_end = pos + len(assistant_header_ids)
-        for i in range(mask_end):
-            labels[i] = -100
-    return labels
 
 
 # ── Data collator with sample weights ────────────────────────────────────────
@@ -293,3 +325,17 @@ class WeightedDataCollator:
 def compute_macro_f1(predictions: List[int], references: List[int]) -> float:
     from sklearn.metrics import f1_score
     return float(f1_score(references, predictions, average="macro", zero_division=0))
+
+
+def print_prediction_distribution(
+    name: str,
+    preds: List[int],
+    id_to_name: Dict[int, str],
+) -> None:
+    counts = Counter(preds)
+    total = len(preds)
+    print(f"[{name}] prediction distribution ({total} samples):")
+    for cls_id in sorted(id_to_name):
+        c = counts.get(cls_id, 0)
+        pct = 100.0 * c / total if total else 0.0
+        print(f"  {cls_id} {id_to_name[cls_id]:<22s} {c:>5d}  ({pct:5.1f}%)")

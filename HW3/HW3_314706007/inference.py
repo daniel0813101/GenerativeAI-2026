@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -19,6 +20,7 @@ from utils import (
     PromptBuilder,
     compute_macro_f1,
     find_pdf,
+    print_prediction_distribution,
     set_seed,
 )
 
@@ -32,8 +34,9 @@ class InferenceConfig:
     cache_dir: str = "paper_cache"
     output_csv: str = "hw3_314706007.csv"
     max_seq_len: int = 2048
-    max_new_tokens: int = 50
+    max_new_tokens: int = 100
     seed: int = 42
+    dev_only: bool = False  # skip test.csv; only score dev.csv
 
 
 # ── Core inference loop ───────────────────────────────────────────────────────
@@ -76,15 +79,34 @@ def run_inference(
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
-
         new_tokens = out[0][inputs["input_ids"].shape[1] :]
         generated = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        predictions.append(output_parser.parse(generated))
+        pred = output_parser.parse(generated)
+
+        if len(predictions) < 10:
+            print(f"[{len(predictions)}] generated: {generated[:300]!r} → pred={pred}")
+
+        predictions.append(pred)
 
     return predictions
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
+def _resolve_adapter_dir(adapter_dir: str) -> Path:
+    """Return adapter_dir as-is, or its latest timestamped subdirectory."""
+    base = Path(adapter_dir)
+    if base.is_dir():
+        ts_dirs = sorted(
+            (d for d in base.iterdir() if d.is_dir() and len(d.name) == 15 and d.name[8] == "-"),
+            key=lambda d: d.name,
+        )
+        if ts_dirs:
+            latest = ts_dirs[-1]
+            print(f"Using latest checkpoint: {latest}")
+            return latest
+    return base
+
 
 def main(config: InferenceConfig) -> None:
     set_seed(config.seed)
@@ -93,8 +115,11 @@ def main(config: InferenceConfig) -> None:
     pdf_dir = data_dir / "paper_evidence"
     classes_json = data_dir / "classes.json"
 
+    adapter_dir = _resolve_adapter_dir(config.adapter_dir)
+
+    os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=config.adapter_dir,
+        model_name=str(adapter_dir),
         max_seq_length=config.max_seq_len,
         dtype=None,
         load_in_4bit=True,
@@ -109,29 +134,31 @@ def main(config: InferenceConfig) -> None:
     prompt_builder = PromptBuilder(classes_json)
     output_parser = OutputParser(classes_json)
 
-    # ── Optional dev evaluation ───────────────────────────────────────────────
-    dev_path = data_dir / "dev.csv"
-    if dev_path.exists():
-        dev_df = pd.read_csv(dev_path)
+    # ── Dev evaluation (only when --dev_only is set) ─────────────────────────
+    if config.dev_only:
+        dev_df = pd.read_csv(data_dir / "dev.csv")
         dev_preds = run_inference(
             dev_df, model, tokenizer, pdf_parser, retriever,
             prompt_builder, output_parser, pdf_dir,
             config.max_seq_len, config.max_new_tokens,
         )
+        print_prediction_distribution("dev", dev_preds, prompt_builder.id_to_name)
         score = compute_macro_f1(dev_preds, dev_df["label"].tolist())
         print(f"Dev Macro F1: {score:.4f}")
 
     # ── Test inference ────────────────────────────────────────────────────────
-    test_df = pd.read_csv(data_dir / "test.csv")
-    preds = run_inference(
-        test_df, model, tokenizer, pdf_parser, retriever,
-        prompt_builder, output_parser, pdf_dir,
-        config.max_seq_len, config.max_new_tokens,
-    )
+    if not config.dev_only:
+        test_df = pd.read_csv(data_dir / "test.csv")
+        preds = run_inference(
+            test_df, model, tokenizer, pdf_parser, retriever,
+            prompt_builder, output_parser, pdf_dir,
+            config.max_seq_len, config.max_new_tokens,
+        )
+        print_prediction_distribution("test", preds, prompt_builder.id_to_name)
 
-    submission = pd.DataFrame({"id": range(len(preds)), "label": preds})
-    submission.to_csv(config.output_csv, index=False)
-    print(f"Saved {len(preds)} predictions → {config.output_csv}")
+        submission = pd.DataFrame({"id": range(len(preds)), "label": preds})
+        submission.to_csv(config.output_csv, index=False)
+        print(f"Saved {len(preds)} predictions → {config.output_csv}")
 
 
 def parse_args() -> InferenceConfig:
