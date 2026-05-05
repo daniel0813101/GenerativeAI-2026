@@ -236,5 +236,10 @@ Temporary Items
 *.tflite
 *.safetensors
 
-#datasets
+# Datasets
 *.csv
+dataset/
+
+# Cache
+paper_cache/
+unsloth_compiled_cache/
