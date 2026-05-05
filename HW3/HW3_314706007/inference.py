@@ -41,7 +41,7 @@ class InferenceConfig:
     max_new_tokens: int = 220
     seed: int = 42
     dev_only: bool = False   # run dev.csv only, skip test.csv
-    test_only: bool = False  # run test.csv only, skip dev.csv
+    test_only: bool = True   # default: run test.csv only, skip dev.csv
     verify: bool = False     # optional second self-verification pass
 
 

@@ -15,7 +15,7 @@ pip install -r requirements.txt
 Expected layout relative to this directory:
 
 ```
-../data/
+../dataset/
 ├── train.csv
 ├── dev.csv
 ├── test.csv
@@ -25,7 +25,7 @@ Expected layout relative to this directory:
     └── ...
 ```
 
-On Kaggle, mount the competition dataset and set `--data_dir` to its path (e.g. `/kaggle/input/genai-hw3/`).
+`python inference.py` uses this `../dataset/` path by default. On Kaggle, either place/copy the competition dataset at `../dataset/`, or pass `--data_dir` explicitly.
 
 ## Training
 
@@ -37,11 +37,11 @@ Key flags (all have defaults):
 
 | Flag | Default | Description |
 |---|---|---|
-| `--data_dir` | `../data` | Path to the dataset folder |
+| `--data_dir` | `../dataset` | Path to the dataset folder |
 | `--adapter_dir` | `adapter_checkpoint` | Where to save the LoRA adapter |
 | `--epochs` | `3` | Training epochs |
-| `--lora_r` | `16` | LoRA rank |
-| `--max_multiplier` | `5` | Oversample cap for minority classes |
+| `--lora_r` | `32` | LoRA rank |
+| `--max_multiplier` | `10` | Oversample cap for minority classes |
 
 PDF text is cached to `paper_cache/` after first parse — re-runs skip parsing.
 
@@ -51,9 +51,34 @@ PDF text is cached to `paper_cache/` after first parse — re-runs skip parsing.
 python inference.py
 ```
 
-Reads `test.csv`, runs inference using the adapter in `adapter_checkpoint/`, and writes predictions to `hw3_314706007.csv`.
+With no arguments, this runs **test only**: it reads `../dataset/test.csv`, loads the latest timestamped adapter under `adapter_checkpoint/`, and writes predictions to `hw3_314706007.csv`.
 
-If `dev.csv` is present it also prints Dev Macro F1 before the test run.
+Useful validation modes:
+
+```bash
+# Dev-only validation
+python inference.py --dev_only --no-test_only
+
+# Evaluate dev first, then write test predictions
+python inference.py --no-test_only
+
+# Three-seed ensemble validation
+python inference.py --dev_only --no-test_only --ensemble_dirs adapter_seed42,adapter_seed43,adapter_seed44
+
+# Final single-adapter test-only run
+python inference.py
+
+# Final three-seed ensemble test-only run
+python inference.py --ensemble_dirs adapter_seed42,adapter_seed43,adapter_seed44
+```
+
+Train the three seed adapters separately:
+
+```bash
+python train.py --data_dir ../dataset --adapter_dir adapter_seed42 --seed 42
+python train.py --data_dir ../dataset --adapter_dir adapter_seed43 --seed 43
+python train.py --data_dir ../dataset --adapter_dir adapter_seed44 --seed 44
+```
 
 ## Reproducing results
 
