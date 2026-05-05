@@ -52,8 +52,8 @@ class TrainingConfig:
     tuning_split_path: str = "../saved_models/splits/default_train_val_split.json"
     batch_size: int = 8
     eval_batch_size: int = 4
-    learning_rate: float = 5e-5
-    num_epochs: int = 30
+    learning_rate: float = 2e-4
+    num_epochs: int = 15
     weight_decay: float = 0.02
     warmup_ratio: float = 0.1
     label_smoothing: float = 0.1
@@ -61,18 +61,18 @@ class TrainingConfig:
     option_order_ensemble: bool = True
     num_option_order_permutations: int = 4
     generation_max_new_tokens: int = 40
-    early_stopping_patience: int = 40
+    early_stopping_patience: int = 5
     early_stopping_min_delta: float = 0.0
-    max_length: int = 1024
+    max_length: int = 768
     grad_accum_steps: int = 4
     val_ratio: float = 0.1
     test_ratio: float = 0.1
     seed: int = 42
     num_workers: int = 4
     use_lora: bool = True
-    lora_r: int = 16
-    lora_alpha: int = 16
-    lora_dropout: float = 0.1
+    lora_r: int = 32
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
     lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
 
 
