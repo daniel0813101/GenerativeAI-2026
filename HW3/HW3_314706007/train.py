@@ -8,6 +8,7 @@ import logging
 import os
 import warnings
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
+logging.getLogger("transformers.generation").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", message="Both `max_new_tokens`.*and `max_length`")
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -45,9 +46,9 @@ class TrainingConfig:
     data_dir: str = "../dataset"
     adapter_dir: str = "adapter_checkpoint"
     cache_dir: str = "paper_cache"
-    max_seq_len: int = 4096
-    lora_r: int = 16
-    lora_alpha: int = 32
+    max_seq_len: int = 3072
+    lora_r: int = 32
+    lora_alpha: int = 64
     lora_dropout: float = 0.05
     batch_size: int = 2
     grad_accum: int = 8
@@ -55,13 +56,18 @@ class TrainingConfig:
     epochs: int = 3
     warmup_ratio: float = 0.1
     max_multiplier: int = 10
+    focal_gamma: float = 0.0  # 0.0 = pure CE; >0 enables focal modulation
     seed: int = 42
 
 
 # ── Weighted Trainer ──────────────────────────────────────────────────────────
 
 class WeightedTrainer(Trainer):
-    """Trainer with per-sample loss weighting to handle class imbalance."""
+    """Trainer with focal loss and per-sample weighting for class imbalance."""
+
+    def __init__(self, *args, focal_gamma: float = 0.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.focal_gamma = focal_gamma
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         sample_weights = inputs.pop("sample_weights", None)
@@ -76,12 +82,22 @@ class WeightedTrainer(Trainer):
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
-        per_token_loss = F.cross_entropy(
+        per_token_ce = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
             ignore_index=-100,
             reduction="none",
         ).view(shift_labels.shape)
+
+        # Focal modulation: down-weight tokens the model is already confident on.
+        # FL = (1 - p)^gamma * CE, where p = exp(-CE).
+        if self.focal_gamma > 0:
+            with torch.no_grad():
+                p = torch.exp(-per_token_ce.clamp(max=20.0))
+                focal_weight = (1.0 - p) ** self.focal_gamma
+            per_token_loss = focal_weight * per_token_ce
+        else:
+            per_token_loss = per_token_ce
 
         mask = (shift_labels != -100).float()
         denom = mask.sum(dim=-1).clamp(min=1)
@@ -89,7 +105,7 @@ class WeightedTrainer(Trainer):
 
         if sample_weights is not None:
             w = sample_weights.to(per_sample_loss.device).float()
-            w = w / w.mean()  # normalize so loss magnitude stays comparable to CE
+            w = w / w.mean()  # normalize so loss magnitude stays comparable
             loss = (per_sample_loss * w).mean()
         else:
             loss = per_sample_loss.mean()
@@ -98,6 +114,52 @@ class WeightedTrainer(Trainer):
 
 
 # ── Dataset construction ──────────────────────────────────────────────────────
+
+def load_training_frame(data_dir: Path) -> tuple[pd.DataFrame, Path]:
+    """Load train.csv or a validated train-only augmentation.
+
+    The assignment forbids mixing dev/test into training. The augmentation
+    script appends generated minority rows after an unchanged copy of train.csv;
+    require that shape before accepting train_augmented.csv.
+    """
+    train_path = data_dir / "train.csv"
+    aug_path = data_dir / "train_augmented.csv"
+    base_df = pd.read_csv(train_path)
+
+    if not aug_path.exists():
+        return base_df, train_path
+
+    aug_df = pd.read_csv(aug_path)
+    required = {"paper_id", "text", "label"}
+    if not required.issubset(aug_df.columns):
+        print("[warn] train_augmented.csv is missing required columns; using train.csv")
+        return base_df, train_path
+    if len(aug_df) < len(base_df):
+        print("[warn] train_augmented.csv is smaller than train.csv; using train.csv")
+        return base_df, train_path
+
+    base_cols = ["paper_id", "text", "label"]
+    prefix_matches = aug_df.loc[: len(base_df) - 1, base_cols].reset_index(drop=True).equals(
+        base_df[base_cols].reset_index(drop=True)
+    )
+    if not prefix_matches:
+        print(
+            "[warn] train_augmented.csv does not start with an unchanged "
+            "train.csv copy; using train.csv"
+        )
+        return base_df, train_path
+
+    extra = aug_df.iloc[len(base_df) :]
+    bad_labels = sorted(set(extra["label"].astype(int)) - {2, 4})
+    if bad_labels:
+        print(
+            "[warn] train_augmented.csv has non-minority generated labels "
+            f"{bad_labels}; using train.csv"
+        )
+        return base_df, train_path
+
+    return aug_df, aug_path
+
 
 def build_tokenized_dataset(
     df: pd.DataFrame,
@@ -241,7 +303,10 @@ def main(config: TrainingConfig) -> None:
     pdf_dir = data_dir / "paper_evidence"
     classes_json = data_dir / "classes.json"
 
-    df = pd.read_csv(data_dir / "train.csv")
+    # Use augmented training set only if it is an append-only train.csv
+    # extension from augment_minorities.py.
+    df, train_path = load_training_frame(data_dir)
+    print(f"[diag] Loaded training set: {train_path.name} ({len(df)} rows)")
     print(f"[diag] Raw class distribution:\n{df['label'].value_counts().sort_index()}")
     df = oversample(df, max_multiplier=config.max_multiplier)
     print(f"[diag] Post-oversample class distribution:\n{df['label'].value_counts().sort_index()}")
@@ -251,6 +316,18 @@ def main(config: TrainingConfig) -> None:
     class_weight_map: Dict[int, float] = {
         int(k): float(v) for k, v in zip(unique_labels, raw_weights)
     }
+    # Mild distribution correction from the latest dev run:
+    #   Entity was over-predicted (+77), while Overgeneralization (-55) and
+    #   Temporal (-10) were under-predicted. Keep the previous AF correction.
+    if 0 in class_weight_map:
+        class_weight_map[0] *= 0.92
+    if 1 in class_weight_map:
+        class_weight_map[1] *= 0.90
+    if 3 in class_weight_map:
+        class_weight_map[3] *= 1.10
+    if 4 in class_weight_map:
+        class_weight_map[4] *= 1.15
+    print(f"[diag] Class weights (distribution-corrected): {class_weight_map}")
 
     os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -281,7 +358,7 @@ def main(config: TrainingConfig) -> None:
     pdf_parser = PDFParser(config.cache_dir)
     pdf_parser.preprocess_all(pdf_dir, df["paper_id"].unique().tolist())
 
-    retriever = EvidenceRetriever(top_k=5, max_tokens=600)
+    retriever = EvidenceRetriever(top_k=7, max_tokens=550)
     prompt_builder = PromptBuilder(classes_json)
 
     train_dataset = build_tokenized_dataset(
@@ -313,6 +390,7 @@ def main(config: TrainingConfig) -> None:
         args=training_args,
         train_dataset=train_dataset,
         data_collator=collator,
+        focal_gamma=config.focal_gamma,
     )
     trainer.train()
 

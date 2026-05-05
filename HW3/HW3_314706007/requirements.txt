@@ -14,8 +14,9 @@ datasets>=2.18.0
 pdfplumber>=0.10.0
 PyPDF2>=3.0.0
 
-# BM25 retrieval
+# Hybrid retrieval: BM25 + embedding (all-MiniLM-L6-v2)
 rank-bm25>=0.2.2
+sentence-transformers>=2.7.0
 
 # Data / evaluation
 pandas>=2.0.0

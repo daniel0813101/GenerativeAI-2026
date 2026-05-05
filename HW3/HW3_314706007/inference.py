@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import gc
 import logging
 import os
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
+logging.getLogger("transformers.generation").setLevel(logging.ERROR)
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import List
@@ -31,16 +34,50 @@ from utils import (
 class InferenceConfig:
     data_dir: str = "../dataset"
     adapter_dir: str = "adapter_checkpoint"
+    ensemble_dirs: str = ""  # comma-separated adapter dirs; overrides adapter_dir
     cache_dir: str = "paper_cache"
     output_csv: str = "hw3_314706007.csv"
-    max_seq_len: int = 4096
-    max_new_tokens: int = 100
+    max_seq_len: int = 3072
+    max_new_tokens: int = 220
     seed: int = 42
     dev_only: bool = False   # run dev.csv only, skip test.csv
     test_only: bool = False  # run test.csv only, skip dev.csv
+    verify: bool = False     # optional second self-verification pass
+
+
+@dataclass
+class InferenceResult:
+    predictions: List[int]
+    parse_fallbacks: int
+    verify_flips: int
 
 
 # ── Core inference loop ───────────────────────────────────────────────────────
+
+def _generate_class(
+    messages, model, tokenizer, output_parser, max_seq_len, max_new_tokens
+) -> tuple[int, str, bool]:
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_seq_len,
+    ).to(model.device)
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    new_tokens = out[0][inputs["input_ids"].shape[1] :]
+    generated = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    pred, used_fallback = output_parser.parse_with_fallback(generated)
+    return pred, generated, used_fallback
+
 
 def run_inference(
     df: pd.DataFrame,
@@ -53,8 +90,11 @@ def run_inference(
     pdf_dir: Path,
     max_seq_len: int,
     max_new_tokens: int,
-) -> List[int]:
+    verify: bool = False,
+) -> InferenceResult:
     predictions: List[int] = []
+    parse_fallbacks = 0
+    flips = 0  # how often verification overruled the first pass
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Inference"):
         pdf_path = find_pdf(pdf_dir, str(row["paper_id"]))
@@ -62,34 +102,48 @@ def run_inference(
         chunks = parser.chunk(raw_text)
         evidence = retriever.retrieve(row["text"], str(row["paper_id"]), chunks)
 
-        messages = prompt_builder.build(row["text"], evidence)
-        prompt = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        # First pass: standard classification
+        messages_1 = prompt_builder.build(row["text"], evidence)
+        first_pred, first_gen, used_fallback = _generate_class(
+            messages_1, model, tokenizer, output_parser, max_seq_len, max_new_tokens,
         )
-        inputs = tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_seq_len,
-        ).to(model.device)
+        parse_fallbacks += int(used_fallback)
 
-        with torch.no_grad():
-            out = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
+        if verify:
+            # Second pass: self-verification with the first prediction in context
+            first_class_name = prompt_builder.id_to_name[first_pred]
+            messages_2 = prompt_builder.build(
+                row["text"], evidence, verify_for=first_class_name,
             )
-        new_tokens = out[0][inputs["input_ids"].shape[1] :]
-        generated = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        pred = output_parser.parse(generated)
+            base_pred, base_gen, used_fallback = _generate_class(
+                messages_2, model, tokenizer, output_parser, max_seq_len, max_new_tokens,
+            )
+            parse_fallbacks += int(used_fallback)
+            if base_pred != first_pred:
+                flips += 1
+        else:
+            base_pred, base_gen = first_pred, first_gen
+
+        final_pred = base_pred
 
         if len(predictions) < 10:
-            print(f"[{len(predictions)}] generated: {generated[:300]!r} → pred={pred}")
+            pred_name = prompt_builder.id_to_name[final_pred]
+            tag = "→" if final_pred == first_pred else f"FLIP {first_pred}→{final_pred}"
+            print(f"[{len(predictions)}] {tag} pred={final_pred} ({pred_name})")
+            print(f"    first:  {first_gen[:250]!r}")
+            if verify:
+                print(f"    verify: {base_gen[:250]!r}")
 
-        predictions.append(pred)
+        predictions.append(final_pred)
 
-    return predictions
+    if verify:
+        print(f"[verify] {flips}/{len(predictions)} predictions changed by verification pass")
+    print(f"[parser] {parse_fallbacks} generated outputs used conservative fallback")
+    return InferenceResult(
+        predictions=predictions,
+        parse_fallbacks=parse_fallbacks,
+        verify_flips=flips,
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -109,6 +163,41 @@ def _resolve_adapter_dir(adapter_dir: str) -> Path:
     return base
 
 
+def _resolve_adapter_dirs(config: InferenceConfig) -> List[Path]:
+    if not config.ensemble_dirs.strip():
+        return [_resolve_adapter_dir(config.adapter_dir)]
+
+    raw_dirs = [d.strip() for d in config.ensemble_dirs.split(",") if d.strip()]
+    if len(raw_dirs) != 3:
+        print(f"[ensemble] warning: expected 3 adapter dirs, got {len(raw_dirs)}")
+    return [_resolve_adapter_dir(d) for d in raw_dirs]
+
+
+def _majority_vote(prediction_sets: List[List[int]]) -> List[int]:
+    if not prediction_sets:
+        return []
+    if len(prediction_sets) == 1:
+        return prediction_sets[0]
+
+    voted: List[int] = []
+    for row_preds in zip(*prediction_sets):
+        counts = Counter(row_preds)
+        best_count = max(counts.values())
+        winners = [label for label, count in counts.items() if count == best_count]
+        # With three seeds, ties mean all three disagree. Use the first adapter
+        # as the deterministic tie-breaker, so the strongest/default seed wins.
+        voted.append(winners[0] if len(winners) == 1 else row_preds[0])
+    return voted
+
+
+def _release_model(model, tokenizer) -> None:
+    del model
+    del tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def main(config: InferenceConfig) -> None:
     set_seed(config.seed)
 
@@ -116,46 +205,73 @@ def main(config: InferenceConfig) -> None:
     pdf_dir = data_dir / "paper_evidence"
     classes_json = data_dir / "classes.json"
 
-    adapter_dir = _resolve_adapter_dir(config.adapter_dir)
-
-    os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=str(adapter_dir),
-        max_seq_length=config.max_seq_len,
-        dtype=None,
-        load_in_4bit=True,
-    )
-    FastLanguageModel.for_inference(model)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-
     pdf_parser = PDFParser(config.cache_dir)
-    retriever = EvidenceRetriever(top_k=5, max_tokens=600)
+    retriever = EvidenceRetriever(top_k=7, max_tokens=550)
     prompt_builder = PromptBuilder(classes_json)
     output_parser = OutputParser(classes_json)
+    adapter_dirs = _resolve_adapter_dirs(config)
+    ensemble = len(adapter_dirs) > 1
 
-    # ── Dev evaluation (skipped when --test_only) ────────────────────────────
-    if not config.test_only:
-        dev_df = pd.read_csv(data_dir / "dev.csv")
-        dev_preds = run_inference(
-            dev_df, model, tokenizer, pdf_parser, retriever,
-            prompt_builder, output_parser, pdf_dir,
-            config.max_seq_len, config.max_new_tokens,
+    dev_df = None if config.test_only else pd.read_csv(data_dir / "dev.csv")
+    test_df = None if config.dev_only else pd.read_csv(data_dir / "test.csv")
+    dev_prediction_sets: List[List[int]] = []
+    test_prediction_sets: List[List[int]] = []
+
+    for idx, adapter_dir in enumerate(adapter_dirs, start=1):
+        print(f"[adapter {idx}/{len(adapter_dirs)}] {adapter_dir}")
+        os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=str(adapter_dir),
+            max_seq_length=config.max_seq_len,
+            dtype=None,
+            load_in_4bit=True,
         )
-        print_prediction_distribution("dev", dev_preds, prompt_builder.id_to_name)
+        FastLanguageModel.for_inference(model)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+
+        # ── Dev evaluation (skipped when --test_only) ────────────────────────
+        if dev_df is not None:
+            dev_result = run_inference(
+                dev_df, model, tokenizer, pdf_parser, retriever,
+                prompt_builder, output_parser, pdf_dir,
+                config.max_seq_len, config.max_new_tokens,
+                verify=config.verify,
+            )
+            dev_preds = dev_result.predictions
+            dev_prediction_sets.append(dev_preds)
+            if ensemble:
+                print_prediction_distribution(
+                    f"dev adapter {idx}", dev_preds, prompt_builder.id_to_name,
+                )
+                score = compute_macro_f1(dev_preds, dev_df["label"].tolist())
+                print(f"Dev Macro F1 adapter {idx}: {score:.4f}")
+
+        # ── Test inference (skipped when --dev_only) ─────────────────────────
+        if test_df is not None:
+            test_result = run_inference(
+                test_df, model, tokenizer, pdf_parser, retriever,
+                prompt_builder, output_parser, pdf_dir,
+                config.max_seq_len, config.max_new_tokens,
+                verify=config.verify,
+            )
+            test_prediction_sets.append(test_result.predictions)
+
+        _release_model(model, tokenizer)
+
+    if dev_df is not None:
+        dev_preds = _majority_vote(dev_prediction_sets)
+        name = "dev ensemble" if ensemble else "dev"
+        print_prediction_distribution(name, dev_preds, prompt_builder.id_to_name)
         score = compute_macro_f1(dev_preds, dev_df["label"].tolist())
-        print(f"Dev Macro F1: {score:.4f}")
+        label = "Dev Macro F1 ensemble" if ensemble else "Dev Macro F1"
+        print(f"{label}: {score:.4f}")
 
-    # ── Test inference (skipped when --dev_only) ─────────────────────────────
-    if not config.dev_only:
-        test_df = pd.read_csv(data_dir / "test.csv")
-        preds = run_inference(
-            test_df, model, tokenizer, pdf_parser, retriever,
-            prompt_builder, output_parser, pdf_dir,
-            config.max_seq_len, config.max_new_tokens,
-        )
-        print_prediction_distribution("test", preds, prompt_builder.id_to_name)
+    if test_df is not None:
+        preds = _majority_vote(test_prediction_sets)
+        name = "test ensemble" if ensemble else "test"
+        print_prediction_distribution(name, preds, prompt_builder.id_to_name)
 
         submission = pd.DataFrame({"id": range(len(preds)), "label": preds})
         submission.to_csv(config.output_csv, index=False)
