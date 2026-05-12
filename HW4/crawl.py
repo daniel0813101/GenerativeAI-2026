@@ -26,6 +26,10 @@ REQUEST_SLEEP_SECONDS = 0.05
 REQUEST_MAX_RETRIES = 5
 REQUEST_RETRY_BACKOFF_SECONDS = 1.0
 SAMPLE_EVERY_N_PAGES = 25
+IMAGE_URL_PATTERN = re.compile(
+    r"https?://[^\s\"'<>]+?\.(?:jpg|jpeg|png|gif)(?=$|[\s\"'<>])",
+    re.IGNORECASE,
+)
 MONTH_NAMES = {
     "01": "January",
     "02": "February",
@@ -574,6 +578,19 @@ def write_json(path: str, item: dict) -> None:
         json.dump(item, file, ensure_ascii=False, indent=2)
 
 
+def extract_image_urls(soup: BeautifulSoup) -> list[str]:
+    """Extracts image URLs from an article page.
+
+    Args:
+        soup: A BeautifulSoup document for an article page.
+
+    Returns:
+        Image URLs matching the assignment definition. Duplicates are retained.
+    """
+    text = soup.get_text("\n")
+    return IMAGE_URL_PATTERN.findall(text)
+
+
 def print_push_status(processed: int, total: int, article: ArticleRecord) -> None:
     """Prints a compact push-processing progress line.
 
@@ -616,6 +633,49 @@ def print_push_summary(
     print(f"- articles processed: {article_count}", flush=True)
     print(f"- push total: {push_total}", flush=True)
     print(f"- boo total: {boo_total}", flush=True)
+    print(f"- output file: {output_path}", flush=True)
+    print(f"- elapsed time: {elapsed}", flush=True)
+
+
+def print_popular_status(processed: int, total: int, article: ArticleRecord) -> None:
+    """Prints a compact popular-processing progress line.
+
+    Args:
+        processed: Number of processed articles.
+        total: Total number of articles to process.
+        article: The current article being processed.
+    """
+    if not sys.stderr.isatty():
+        return
+    message = (
+        f"[popular] {processed}/{total} date={article.date} "
+        f"url={article.url}"
+    )
+    sys.stderr.write("\r\033[K" + message)
+    sys.stderr.flush()
+
+
+def print_popular_summary(
+    output_path: str,
+    article_count: int,
+    image_count: int,
+    started_at: float,
+) -> None:
+    """Prints the final popular summary.
+
+    Args:
+        output_path: Path to the generated popular JSON file.
+        article_count: Number of popular articles processed.
+        image_count: Number of extracted image URLs.
+        started_at: Monotonic start time of the popular command.
+    """
+    if sys.stderr.isatty():
+        sys.stderr.write("\r\033[K")
+        sys.stderr.flush()
+    elapsed = format_elapsed(time.monotonic() - started_at)
+    print("Popular summary", flush=True)
+    print(f"- popular articles processed: {article_count}", flush=True)
+    print(f"- image URLs extracted: {image_count}", flush=True)
     print(f"- output file: {output_path}", flush=True)
     print(f"- elapsed time: {elapsed}", flush=True)
 
@@ -668,6 +728,39 @@ def push(start_date: str, end_date: str, output_dir: str = ".") -> None:
         output["boo"]["total"],
         started_at,
     )
+
+
+def popular(start_date: str, end_date: str, output_dir: str = ".") -> None:
+    """Extracts image URLs from popular articles in a date range.
+
+    Args:
+        start_date: Inclusive start date in ``MMDD`` format.
+        end_date: Inclusive end date in ``MMDD`` format.
+        output_dir: Directory containing ``popular_articles.jsonl`` and
+            receiving the generated ``popular_{start_date}_{end_date}.json``.
+    """
+    started_at = time.monotonic()
+    articles_path = os.path.join(output_dir, "popular_articles.jsonl")
+    output_path = os.path.join(output_dir, f"popular_{start_date}_{end_date}.json")
+    articles = filter_articles_by_date(
+        load_articles(articles_path),
+        start_date,
+        end_date,
+    )
+
+    image_urls: list[str] = []
+    total = len(articles)
+
+    for index, article in enumerate(articles, start=1):
+        print_popular_status(index, total, article)
+        image_urls.extend(extract_image_urls(fetch_soup(article.url)))
+
+    output = {
+        "number_of_popular_articles": total,
+        "image_urls": image_urls,
+    }
+    write_json(output_path, output)
+    print_popular_summary(output_path, total, len(image_urls), started_at)
 
 
 def should_collect_entry(entry: IndexEntry, seen_jan_first: bool) -> tuple[bool, bool]:
@@ -812,6 +905,21 @@ def parse_args() -> argparse.Namespace:
         default=".",
         help="Directory containing articles.jsonl and receiving push output.",
     )
+
+    popular_parser = subparsers.add_parser(
+        "popular",
+        help="Extract image URLs from popular articles in a date range.",
+    )
+    popular_parser.add_argument("start_date", help="Inclusive start date in MMDD format.")
+    popular_parser.add_argument("end_date", help="Inclusive end date in MMDD format.")
+    popular_parser.add_argument(
+        "--output-dir",
+        default=".",
+        help=(
+            "Directory containing popular_articles.jsonl and receiving "
+            "popular output."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -822,6 +930,8 @@ def main() -> None:
         crawl(args.output_dir)
     elif args.command == "push":
         push(args.start_date, args.end_date, args.output_dir)
+    elif args.command == "popular":
+        popular(args.start_date, args.end_date, args.output_dir)
     else:
         raise ValueError(f"Unsupported command: {args.command}")
 
