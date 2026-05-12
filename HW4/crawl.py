@@ -23,7 +23,6 @@ TARGET_YEAR = 2025
 REQUEST_TIMEOUT = 15
 REQUEST_SLEEP_SECONDS = 0.05
 SAMPLE_EVERY_N_PAGES = 25
-STATUS_UPDATE_SECONDS = 1.0
 
 SESSION = requests.Session()
 SESSION.headers.update(
@@ -57,7 +56,6 @@ class CrawlStats:
     phase: str = "seeking-2025-12-31"
     current_date: str | None = None
     current_month: str | None = None
-    last_status_at: float = 0.0
     last_status_length: int = 0
 
 
@@ -349,22 +347,16 @@ def clear_status_line(stats: CrawlStats) -> None:
         stats.last_status_length = 0
 
 
-def update_status_line(stats: CrawlStats, force: bool = False) -> None:
-    """Refreshes the crawl status line at most once per second.
+def update_status_line(stats: CrawlStats) -> None:
+    """Refreshes the crawl status line.
 
     Args:
         stats: Current crawl counters and timing data.
-        force: Whether to print even if the throttle interval has not passed.
     """
-    now = time.monotonic()
-    if not force and now - stats.last_status_at < STATUS_UPDATE_SECONDS:
-        return
-
     message = build_status_message(stats)
     padding = max(stats.last_status_length - len(message), 0)
     sys.stderr.write("\r" + message + (" " * padding))
     sys.stderr.flush()
-    stats.last_status_at = now
     stats.last_status_length = len(message)
 
 
@@ -377,7 +369,7 @@ def print_crawl_event(stats: CrawlStats, message: str) -> None:
     """
     clear_status_line(stats)
     print(message, flush=True)
-    update_status_line(stats, force=True)
+    update_status_line(stats)
 
 
 def print_month_finish(stats: CrawlStats, finished_month: str) -> None:
@@ -462,7 +454,7 @@ def crawl(output_dir: str = ".") -> None:
     collecting = False
     seen_jan_first = False
     stats = CrawlStats(started_at=time.monotonic())
-    update_status_line(stats, force=True)
+    update_status_line(stats)
 
     try:
         while url:
@@ -479,7 +471,6 @@ def crawl(output_dir: str = ".") -> None:
                     stats.phase = "collecting-2025"
                     print_crawl_event(stats, "Start collecting: confirmed 2025-12-31")
                 else:
-                    update_status_line(stats)
                     url = previous_url
                     continue
 
@@ -487,7 +478,7 @@ def crawl(output_dir: str = ".") -> None:
                 year = sample_year(entries)
                 if year is not None and year < TARGET_YEAR:
                     stats.phase = "stopped-before-2025"
-                    update_status_line(stats, force=True)
+                    update_status_line(stats)
                     break
 
             for entry in entries:
@@ -507,19 +498,16 @@ def crawl(output_dir: str = ".") -> None:
                         stats.popular += 1
                     if entry.date == "0101":
                         seen_jan_first = True
+                    update_status_line(stats)
 
                 if stop:
                     stats.phase = "done"
-                    update_status_line(stats, force=True)
+                    update_status_line(stats)
                     url = None
                     break
 
-                update_status_line(stats)
-
             if stats.phase == "done":
                 break
-
-            update_status_line(stats)
             url = previous_url
     finally:
         if stats.current_month is not None and stats.phase == "done":
