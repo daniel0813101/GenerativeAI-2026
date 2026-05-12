@@ -74,6 +74,7 @@ class CrawlStats:
     month_articles: int = 0
     month_popular: int = 0
     last_status_length: int = 0
+    status_updates: int = 0
 
 
 def fetch(url: str) -> str:
@@ -346,7 +347,8 @@ def build_status_message(stats: CrawlStats) -> str:
     elapsed = format_elapsed(time.monotonic() - stats.started_at)
     return (
         "[crawl] "
-        f"phase={stats.phase} pages={stats.pages} articles={stats.articles} "
+        f"update={stats.status_updates} phase={stats.phase} "
+        f"pages={stats.pages} articles={stats.articles} "
         f"popular={stats.popular} date={stats.current_date or '-'} "
         f"url={stats.current_url or '-'} elapsed={elapsed}"
     )
@@ -370,6 +372,7 @@ def update_status_line(stats: CrawlStats) -> None:
     Args:
         stats: Current crawl counters and timing data.
     """
+    stats.status_updates += 1
     message = build_status_message(stats)
     padding = max(stats.last_status_length - len(message), 0)
     sys.stderr.write("\r" + message + (" " * padding))
