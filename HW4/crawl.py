@@ -75,6 +75,7 @@ class CrawlStats:
     month_popular: int = 0
     last_status_length: int = 0
     status_updates: int = 0
+    status_started: bool = False
 
 
 def fetch(url: str) -> str:
@@ -360,8 +361,8 @@ def clear_status_line(stats: CrawlStats) -> None:
     Args:
         stats: Current crawl counters and terminal status metadata.
     """
-    if stats.last_status_length:
-        sys.stderr.write("\r" + (" " * stats.last_status_length) + "\r")
+    if stats.last_status_length and sys.stderr.isatty():
+        sys.stderr.write("\r\033[K")
         sys.stderr.flush()
         stats.last_status_length = 0
 
@@ -372,12 +373,15 @@ def update_status_line(stats: CrawlStats) -> None:
     Args:
         stats: Current crawl counters and timing data.
     """
+    if not sys.stderr.isatty():
+        return
+
     stats.status_updates += 1
     message = build_status_message(stats)
-    padding = max(stats.last_status_length - len(message), 0)
-    sys.stderr.write("\r" + message + (" " * padding))
+    sys.stderr.write("\r\033[K" + message)
     sys.stderr.flush()
     stats.last_status_length = len(message)
+    stats.status_started = True
 
 
 def print_crawl_event(stats: CrawlStats, message: str) -> None:
@@ -403,8 +407,8 @@ def print_month_finish(stats: CrawlStats, finished_month: str) -> None:
     print_crawl_event(
         stats,
         (
-            f"{month_name} Finish "
-            f"(articles={stats.month_articles}, popular={stats.month_popular})"
+            f"{month_name} Finish: "
+            f"articles={stats.month_articles}, popular={stats.month_popular}"
         ),
     )
     stats.month_articles = 0
