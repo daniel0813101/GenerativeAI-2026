@@ -69,7 +69,6 @@ class CrawlStats:
     popular: int = 0
     phase: str = "seeking-2025-12-31"
     current_date: str | None = None
-    current_url: str | None = None
     current_month: str | None = None
     month_articles: int = 0
     month_popular: int = 0
@@ -351,7 +350,7 @@ def build_status_message(stats: CrawlStats) -> str:
         f"update={stats.status_updates} phase={stats.phase} "
         f"pages={stats.pages} articles={stats.articles} "
         f"popular={stats.popular} date={stats.current_date or '-'} "
-        f"url={stats.current_url or '-'} elapsed={elapsed}"
+        f"elapsed={elapsed}"
     )
 
 
@@ -486,7 +485,6 @@ def crawl(output_dir: str = ".") -> None:
     try:
         while url:
             stats.pages += 1
-            stats.current_url = url
             soup = fetch_soup(url)
             entries = list(reversed(parse_index_entries(soup)))
             previous_url = parse_previous_page_url(soup)
