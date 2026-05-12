@@ -23,6 +23,20 @@ TARGET_YEAR = 2025
 REQUEST_TIMEOUT = 15
 REQUEST_SLEEP_SECONDS = 0.05
 SAMPLE_EVERY_N_PAGES = 25
+MONTH_NAMES = {
+    "01": "January",
+    "02": "February",
+    "03": "March",
+    "04": "April",
+    "05": "May",
+    "06": "June",
+    "07": "July",
+    "08": "August",
+    "09": "September",
+    "10": "October",
+    "11": "November",
+    "12": "December",
+}
 
 SESSION = requests.Session()
 SESSION.headers.update(
@@ -55,7 +69,10 @@ class CrawlStats:
     popular: int = 0
     phase: str = "seeking-2025-12-31"
     current_date: str | None = None
+    current_url: str | None = None
     current_month: str | None = None
+    month_articles: int = 0
+    month_popular: int = 0
     last_status_length: int = 0
 
 
@@ -331,7 +348,7 @@ def build_status_message(stats: CrawlStats) -> str:
         "[crawl] "
         f"phase={stats.phase} pages={stats.pages} articles={stats.articles} "
         f"popular={stats.popular} date={stats.current_date or '-'} "
-        f"elapsed={elapsed}"
+        f"url={stats.current_url or '-'} elapsed={elapsed}"
     )
 
 
@@ -379,13 +396,16 @@ def print_month_finish(stats: CrawlStats, finished_month: str) -> None:
         stats: Current crawl counters and terminal status metadata.
         finished_month: The two-digit month that has just been completed.
     """
+    month_name = MONTH_NAMES.get(finished_month, finished_month)
     print_crawl_event(
         stats,
         (
-            f"Month finish: {TARGET_YEAR}-{finished_month} "
-            f"(articles={stats.articles}, popular={stats.popular})"
+            f"{month_name} Finish "
+            f"(articles={stats.month_articles}, popular={stats.month_popular})"
         ),
     )
+    stats.month_articles = 0
+    stats.month_popular = 0
 
 
 def print_crawl_summary(stats: CrawlStats, articles_path: str, popular_path: str) -> None:
@@ -459,10 +479,13 @@ def crawl(output_dir: str = ".") -> None:
     try:
         while url:
             stats.pages += 1
+            stats.current_url = url
             soup = fetch_soup(url)
             entries = list(reversed(parse_index_entries(soup)))
             previous_url = parse_previous_page_url(soup)
             stats.current_date = entries[0].date if entries else None
+            if not collecting:
+                update_status_line(stats)
 
             if not collecting:
                 year = first_year_for_date(entries, "1231")
@@ -494,8 +517,10 @@ def crawl(output_dir: str = ".") -> None:
 
                     write_article_outputs(entry, articles_path, popular_path)
                     stats.articles += 1
+                    stats.month_articles += 1
                     if entry.push_mark == "爆":
                         stats.popular += 1
+                        stats.month_popular += 1
                     if entry.date == "0101":
                         seen_jan_first = True
                     update_status_line(stats)
