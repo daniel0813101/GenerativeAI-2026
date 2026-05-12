@@ -23,6 +23,20 @@ TARGET_YEAR = 2025
 REQUEST_TIMEOUT = 15
 REQUEST_SLEEP_SECONDS = 0.05
 SAMPLE_EVERY_N_PAGES = 25
+MONTH_NAMES = {
+    "01": "January",
+    "02": "February",
+    "03": "March",
+    "04": "April",
+    "05": "May",
+    "06": "June",
+    "07": "July",
+    "08": "August",
+    "09": "September",
+    "10": "October",
+    "11": "November",
+    "12": "December",
+}
 
 SESSION = requests.Session()
 SESSION.headers.update(
@@ -56,7 +70,11 @@ class CrawlStats:
     phase: str = "seeking-2025-12-31"
     current_date: str | None = None
     current_month: str | None = None
+    month_articles: int = 0
+    month_popular: int = 0
     last_status_length: int = 0
+    status_updates: int = 0
+    status_started: bool = False
 
 
 def fetch(url: str) -> str:
@@ -329,7 +347,8 @@ def build_status_message(stats: CrawlStats) -> str:
     elapsed = format_elapsed(time.monotonic() - stats.started_at)
     return (
         "[crawl] "
-        f"phase={stats.phase} pages={stats.pages} articles={stats.articles} "
+        f"update={stats.status_updates} phase={stats.phase} "
+        f"pages={stats.pages} articles={stats.articles} "
         f"popular={stats.popular} date={stats.current_date or '-'} "
         f"elapsed={elapsed}"
     )
@@ -341,8 +360,8 @@ def clear_status_line(stats: CrawlStats) -> None:
     Args:
         stats: Current crawl counters and terminal status metadata.
     """
-    if stats.last_status_length:
-        sys.stderr.write("\r" + (" " * stats.last_status_length) + "\r")
+    if stats.last_status_length and sys.stderr.isatty():
+        sys.stderr.write("\r\033[K")
         sys.stderr.flush()
         stats.last_status_length = 0
 
@@ -353,11 +372,15 @@ def update_status_line(stats: CrawlStats) -> None:
     Args:
         stats: Current crawl counters and timing data.
     """
+    if not sys.stderr.isatty():
+        return
+
+    stats.status_updates += 1
     message = build_status_message(stats)
-    padding = max(stats.last_status_length - len(message), 0)
-    sys.stderr.write("\r" + message + (" " * padding))
+    sys.stderr.write("\r\033[K" + message)
     sys.stderr.flush()
     stats.last_status_length = len(message)
+    stats.status_started = True
 
 
 def print_crawl_event(stats: CrawlStats, message: str) -> None:
@@ -379,13 +402,16 @@ def print_month_finish(stats: CrawlStats, finished_month: str) -> None:
         stats: Current crawl counters and terminal status metadata.
         finished_month: The two-digit month that has just been completed.
     """
+    month_name = MONTH_NAMES.get(finished_month, finished_month)
     print_crawl_event(
         stats,
         (
-            f"Month finish: {TARGET_YEAR}-{finished_month} "
-            f"(articles={stats.articles}, popular={stats.popular})"
+            f"{month_name} Finish: "
+            f"articles={stats.month_articles}, popular={stats.month_popular}"
         ),
     )
+    stats.month_articles = 0
+    stats.month_popular = 0
 
 
 def print_crawl_summary(stats: CrawlStats, articles_path: str, popular_path: str) -> None:
@@ -463,6 +489,8 @@ def crawl(output_dir: str = ".") -> None:
             entries = list(reversed(parse_index_entries(soup)))
             previous_url = parse_previous_page_url(soup)
             stats.current_date = entries[0].date if entries else None
+            if not collecting:
+                update_status_line(stats)
 
             if not collecting:
                 year = first_year_for_date(entries, "1231")
@@ -494,8 +522,10 @@ def crawl(output_dir: str = ".") -> None:
 
                     write_article_outputs(entry, articles_path, popular_path)
                     stats.articles += 1
+                    stats.month_articles += 1
                     if entry.push_mark == "爆":
                         stats.popular += 1
+                        stats.month_popular += 1
                     if entry.date == "0101":
                         seen_jan_first = True
                     update_status_line(stats)
