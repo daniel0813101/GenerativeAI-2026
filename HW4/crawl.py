@@ -15,6 +15,11 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - fallback for minimal environments.
+    tqdm = None
+
 
 BASE_URL = "https://www.ptt.cc"
 STOCK_INDEX_URL = f"{BASE_URL}/bbs/Stock/index.html"
@@ -287,6 +292,58 @@ def remove_existing_outputs(paths: Iterable[str]) -> None:
             pass
 
 
+def create_progress_bar():
+    """Creates an indeterminate progress bar for the crawl loop.
+
+    Returns:
+        A tqdm progress bar when tqdm is available, otherwise ``None``.
+    """
+    if tqdm is None:
+        return None
+    return tqdm(
+        desc="Scanning PTT Stock pages",
+        unit="page",
+        dynamic_ncols=True,
+    )
+
+
+def update_progress_bar(
+    progress_bar,
+    phase: str,
+    pages: int,
+    articles: int,
+    popular: int,
+    current_date: str | None,
+) -> None:
+    """Updates the crawl progress bar with current counters.
+
+    Args:
+        progress_bar: The tqdm progress bar, or ``None`` when tqdm is absent.
+        phase: The current crawl phase.
+        pages: Number of list pages scanned.
+        articles: Number of articles written.
+        popular: Number of popular articles written.
+        current_date: Most recent list-page date being processed.
+    """
+    if progress_bar is None:
+        if pages == 1 or pages % 25 == 0:
+            print(
+                "[crawl] "
+                f"phase={phase} pages={pages} articles={articles} "
+                f"popular={popular} date={current_date or '-'}",
+                flush=True,
+            )
+        return
+
+    progress_bar.set_postfix(
+        phase=phase,
+        articles=articles,
+        popular=popular,
+        date=current_date or "-",
+    )
+    progress_bar.update(1)
+
+
 def should_collect_entry(entry: IndexEntry, seen_jan_first: bool) -> tuple[bool, bool]:
     """Decides whether to collect an entry after crawl has entered 2025.
 
@@ -334,36 +391,90 @@ def crawl(output_dir: str = ".") -> None:
     collecting = False
     seen_jan_first = False
     page_count = 0
+    article_count = 0
+    popular_count = 0
+    phase = "seeking-2025-12-31"
+    progress_bar = create_progress_bar()
 
-    while url:
-        page_count += 1
-        soup = fetch_soup(url)
-        entries = list(reversed(parse_index_entries(soup)))
-        previous_url = parse_previous_page_url(soup)
+    try:
+        while url:
+            page_count += 1
+            soup = fetch_soup(url)
+            entries = list(reversed(parse_index_entries(soup)))
+            previous_url = parse_previous_page_url(soup)
+            current_date = entries[0].date if entries else None
 
-        if not collecting:
-            year = first_year_for_date(entries, "1231")
-            if year == TARGET_YEAR:
-                collecting = True
-            else:
-                url = previous_url
-                continue
+            if not collecting:
+                year = first_year_for_date(entries, "1231")
+                if year == TARGET_YEAR:
+                    collecting = True
+                    phase = "collecting-2025"
+                else:
+                    update_progress_bar(
+                        progress_bar,
+                        phase,
+                        page_count,
+                        article_count,
+                        popular_count,
+                        current_date,
+                    )
+                    url = previous_url
+                    continue
 
-        if page_count % SAMPLE_EVERY_N_PAGES == 0:
-            year = sample_year(entries)
-            if year is not None and year < TARGET_YEAR:
-                break
+            if page_count % SAMPLE_EVERY_N_PAGES == 0:
+                year = sample_year(entries)
+                if year is not None and year < TARGET_YEAR:
+                    phase = "stopped-before-2025"
+                    update_progress_bar(
+                        progress_bar,
+                        phase,
+                        page_count,
+                        article_count,
+                        popular_count,
+                        current_date,
+                    )
+                    break
 
-        for entry in entries:
-            collect, stop = should_collect_entry(entry, seen_jan_first)
-            if collect:
-                write_article_outputs(entry, articles_path, popular_path)
-                if entry.date == "0101":
-                    seen_jan_first = True
-            if stop:
-                return
+            for entry in entries:
+                collect, stop = should_collect_entry(entry, seen_jan_first)
+                if collect:
+                    write_article_outputs(entry, articles_path, popular_path)
+                    article_count += 1
+                    if entry.push_mark == "爆":
+                        popular_count += 1
+                    if entry.date == "0101":
+                        seen_jan_first = True
+                if stop:
+                    phase = "done"
+                    update_progress_bar(
+                        progress_bar,
+                        phase,
+                        page_count,
+                        article_count,
+                        popular_count,
+                        entry.date,
+                    )
+                    return
 
-        url = previous_url
+            update_progress_bar(
+                progress_bar,
+                phase,
+                page_count,
+                article_count,
+                popular_count,
+                current_date,
+            )
+            url = previous_url
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+
+    if tqdm is None:
+        print(
+            "[crawl] "
+            f"done pages={page_count} articles={article_count} popular={popular_count}",
+            flush=True,
+        )
 
 
 def parse_args() -> argparse.Namespace:
