@@ -22,6 +22,8 @@ STOCK_INDEX_URL = f"{BASE_URL}/bbs/Stock/index.html"
 TARGET_YEAR = 2025
 REQUEST_TIMEOUT = 15
 REQUEST_SLEEP_SECONDS = 0.05
+REQUEST_MAX_RETRIES = 5
+REQUEST_RETRY_BACKOFF_SECONDS = 1.0
 SAMPLE_EVERY_N_PAGES = 25
 MONTH_NAMES = {
     "01": "January",
@@ -88,13 +90,31 @@ def fetch(url: str) -> str:
 
     Raises:
         requests.HTTPError: If the server returns an unsuccessful status code.
-        requests.RequestException: If the request fails.
+        requests.RequestException: If the request fails after all retries.
     """
-    time.sleep(REQUEST_SLEEP_SECONDS)
-    response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    response.encoding = "utf-8"
-    return response.text
+    last_error: requests.RequestException | None = None
+    for attempt in range(1, REQUEST_MAX_RETRIES + 1):
+        try:
+            time.sleep(REQUEST_SLEEP_SECONDS)
+            response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            response.encoding = "utf-8"
+            return response.text
+        except requests.RequestException as error:
+            last_error = error
+            if attempt == REQUEST_MAX_RETRIES:
+                break
+            sleep_seconds = REQUEST_RETRY_BACKOFF_SECONDS * attempt
+            print(
+                "[retry] "
+                f"attempt={attempt}/{REQUEST_MAX_RETRIES} "
+                f"sleep={sleep_seconds:.1f}s url={url} error={error}",
+                flush=True,
+            )
+            time.sleep(sleep_seconds)
+
+    assert last_error is not None
+    raise last_error
 
 
 def fetch_soup(url: str) -> BeautifulSoup:
