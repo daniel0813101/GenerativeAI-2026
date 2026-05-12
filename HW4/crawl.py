@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,11 +16,6 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-try:
-    from tqdm import tqdm
-except ImportError:  # pragma: no cover - fallback for minimal environments.
-    tqdm = None
-
 
 BASE_URL = "https://www.ptt.cc"
 STOCK_INDEX_URL = f"{BASE_URL}/bbs/Stock/index.html"
@@ -27,6 +23,7 @@ TARGET_YEAR = 2025
 REQUEST_TIMEOUT = 15
 REQUEST_SLEEP_SECONDS = 0.05
 SAMPLE_EVERY_N_PAGES = 25
+STATUS_UPDATE_SECONDS = 1.0
 
 SESSION = requests.Session()
 SESSION.headers.update(
@@ -47,6 +44,21 @@ class IndexEntry:
     title: str
     url: str
     push_mark: str
+
+
+@dataclass
+class CrawlStats:
+    """Mutable counters and timing data for one crawl run."""
+
+    started_at: float
+    pages: int = 0
+    articles: int = 0
+    popular: int = 0
+    phase: str = "seeking-2025-12-31"
+    current_date: str | None = None
+    current_month: str | None = None
+    last_status_at: float = 0.0
+    last_status_length: int = 0
 
 
 def fetch(url: str) -> str:
@@ -292,56 +304,115 @@ def remove_existing_outputs(paths: Iterable[str]) -> None:
             pass
 
 
-def create_progress_bar():
-    """Creates an indeterminate progress bar for the crawl loop.
-
-    Returns:
-        A tqdm progress bar when tqdm is available, otherwise ``None``.
-    """
-    if tqdm is None:
-        return None
-    return tqdm(
-        desc="Scanning PTT Stock pages",
-        unit="page",
-        dynamic_ncols=True,
-    )
-
-
-def update_progress_bar(
-    progress_bar,
-    phase: str,
-    pages: int,
-    articles: int,
-    popular: int,
-    current_date: str | None,
-) -> None:
-    """Updates the crawl progress bar with current counters.
+def format_elapsed(seconds: float) -> str:
+    """Formats elapsed seconds as a compact duration string.
 
     Args:
-        progress_bar: The tqdm progress bar, or ``None`` when tqdm is absent.
-        phase: The current crawl phase.
-        pages: Number of list pages scanned.
-        articles: Number of articles written.
-        popular: Number of popular articles written.
-        current_date: Most recent list-page date being processed.
+        seconds: Number of elapsed seconds.
+
+    Returns:
+        A ``HH:MM:SS`` duration string.
     """
-    if progress_bar is None:
-        if pages == 1 or pages % 25 == 0:
-            print(
-                "[crawl] "
-                f"phase={phase} pages={pages} articles={articles} "
-                f"popular={popular} date={current_date or '-'}",
-                flush=True,
-            )
+    total_seconds = int(seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def build_status_message(stats: CrawlStats) -> str:
+    """Builds the one-line crawl status message.
+
+    Args:
+        stats: Current crawl counters and timing data.
+
+    Returns:
+        A single-line status message.
+    """
+    elapsed = format_elapsed(time.monotonic() - stats.started_at)
+    return (
+        "[crawl] "
+        f"phase={stats.phase} pages={stats.pages} articles={stats.articles} "
+        f"popular={stats.popular} date={stats.current_date or '-'} "
+        f"elapsed={elapsed}"
+    )
+
+
+def clear_status_line(stats: CrawlStats) -> None:
+    """Clears the currently displayed terminal status line.
+
+    Args:
+        stats: Current crawl counters and terminal status metadata.
+    """
+    if stats.last_status_length:
+        sys.stderr.write("\r" + (" " * stats.last_status_length) + "\r")
+        sys.stderr.flush()
+        stats.last_status_length = 0
+
+
+def update_status_line(stats: CrawlStats, force: bool = False) -> None:
+    """Refreshes the crawl status line at most once per second.
+
+    Args:
+        stats: Current crawl counters and timing data.
+        force: Whether to print even if the throttle interval has not passed.
+    """
+    now = time.monotonic()
+    if not force and now - stats.last_status_at < STATUS_UPDATE_SECONDS:
         return
 
-    progress_bar.set_postfix(
-        phase=phase,
-        articles=articles,
-        popular=popular,
-        date=current_date or "-",
+    message = build_status_message(stats)
+    padding = max(stats.last_status_length - len(message), 0)
+    sys.stderr.write("\r" + message + (" " * padding))
+    sys.stderr.flush()
+    stats.last_status_at = now
+    stats.last_status_length = len(message)
+
+
+def print_crawl_event(stats: CrawlStats, message: str) -> None:
+    """Prints a crawl event without leaving a stale status line behind.
+
+    Args:
+        stats: Current crawl counters and terminal status metadata.
+        message: Event message to print.
+    """
+    clear_status_line(stats)
+    print(message, flush=True)
+    update_status_line(stats, force=True)
+
+
+def print_month_finish(stats: CrawlStats, finished_month: str) -> None:
+    """Prints a message when crawling finishes a month.
+
+    Args:
+        stats: Current crawl counters and terminal status metadata.
+        finished_month: The two-digit month that has just been completed.
+    """
+    print_crawl_event(
+        stats,
+        (
+            f"Month finish: {TARGET_YEAR}-{finished_month} "
+            f"(articles={stats.articles}, popular={stats.popular})"
+        ),
     )
-    progress_bar.update(1)
+
+
+def print_crawl_summary(stats: CrawlStats, articles_path: str, popular_path: str) -> None:
+    """Prints the final crawl summary.
+
+    Args:
+        stats: Final crawl counters and timing data.
+        articles_path: Path to the generated ``articles.jsonl`` file.
+        popular_path: Path to the generated ``popular_articles.jsonl`` file.
+    """
+    clear_status_line(stats)
+    elapsed = format_elapsed(time.monotonic() - stats.started_at)
+    print("Crawl summary", flush=True)
+    print(f"- pages scanned: {stats.pages}", flush=True)
+    print(f"- articles written: {stats.articles}", flush=True)
+    print(f"- popular articles written: {stats.popular}", flush=True)
+    print(f"- articles file: {articles_path}", flush=True)
+    print(f"- popular articles file: {popular_path}", flush=True)
+    print(f"- elapsed time: {elapsed}", flush=True)
 
 
 def should_collect_entry(entry: IndexEntry, seen_jan_first: bool) -> tuple[bool, bool]:
@@ -390,91 +461,70 @@ def crawl(output_dir: str = ".") -> None:
     url: str | None = STOCK_INDEX_URL
     collecting = False
     seen_jan_first = False
-    page_count = 0
-    article_count = 0
-    popular_count = 0
-    phase = "seeking-2025-12-31"
-    progress_bar = create_progress_bar()
+    stats = CrawlStats(started_at=time.monotonic())
+    update_status_line(stats, force=True)
 
     try:
         while url:
-            page_count += 1
+            stats.pages += 1
             soup = fetch_soup(url)
             entries = list(reversed(parse_index_entries(soup)))
             previous_url = parse_previous_page_url(soup)
-            current_date = entries[0].date if entries else None
+            stats.current_date = entries[0].date if entries else None
 
             if not collecting:
                 year = first_year_for_date(entries, "1231")
                 if year == TARGET_YEAR:
                     collecting = True
-                    phase = "collecting-2025"
+                    stats.phase = "collecting-2025"
+                    print_crawl_event(stats, "Start collecting: confirmed 2025-12-31")
                 else:
-                    update_progress_bar(
-                        progress_bar,
-                        phase,
-                        page_count,
-                        article_count,
-                        popular_count,
-                        current_date,
-                    )
+                    update_status_line(stats)
                     url = previous_url
                     continue
 
-            if page_count % SAMPLE_EVERY_N_PAGES == 0:
+            if stats.pages % SAMPLE_EVERY_N_PAGES == 0:
                 year = sample_year(entries)
                 if year is not None and year < TARGET_YEAR:
-                    phase = "stopped-before-2025"
-                    update_progress_bar(
-                        progress_bar,
-                        phase,
-                        page_count,
-                        article_count,
-                        popular_count,
-                        current_date,
-                    )
+                    stats.phase = "stopped-before-2025"
+                    update_status_line(stats, force=True)
                     break
 
             for entry in entries:
+                stats.current_date = entry.date
                 collect, stop = should_collect_entry(entry, seen_jan_first)
                 if collect:
+                    month = entry.date[:2]
+                    if stats.current_month is None:
+                        stats.current_month = month
+                    elif month != stats.current_month:
+                        print_month_finish(stats, stats.current_month)
+                        stats.current_month = month
+
                     write_article_outputs(entry, articles_path, popular_path)
-                    article_count += 1
+                    stats.articles += 1
                     if entry.push_mark == "爆":
-                        popular_count += 1
+                        stats.popular += 1
                     if entry.date == "0101":
                         seen_jan_first = True
-                if stop:
-                    phase = "done"
-                    update_progress_bar(
-                        progress_bar,
-                        phase,
-                        page_count,
-                        article_count,
-                        popular_count,
-                        entry.date,
-                    )
-                    return
 
-            update_progress_bar(
-                progress_bar,
-                phase,
-                page_count,
-                article_count,
-                popular_count,
-                current_date,
-            )
+                if stop:
+                    stats.phase = "done"
+                    update_status_line(stats, force=True)
+                    url = None
+                    break
+
+                update_status_line(stats)
+
+            if stats.phase == "done":
+                break
+
+            update_status_line(stats)
             url = previous_url
     finally:
-        if progress_bar is not None:
-            progress_bar.close()
-
-    if tqdm is None:
-        print(
-            "[crawl] "
-            f"done pages={page_count} articles={article_count} popular={popular_count}",
-            flush=True,
-        )
+        if stats.current_month is not None and stats.phase == "done":
+            print_month_finish(stats, stats.current_month)
+        print_crawl_summary(stats, articles_path, popular_path)
 
 
 def parse_args() -> argparse.Namespace:
