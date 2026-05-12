@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
@@ -77,6 +78,15 @@ class CrawlStats:
     last_status_length: int = 0
     status_updates: int = 0
     status_started: bool = False
+
+
+@dataclass(frozen=True)
+class ArticleRecord:
+    """Article data loaded from ``articles.jsonl``."""
+
+    date: str
+    title: str
+    url: str
 
 
 def fetch(url: str) -> str:
@@ -313,6 +323,53 @@ def append_jsonl(path: str, item: dict[str, str]) -> None:
         file.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
+def load_articles(path: str) -> list[ArticleRecord]:
+    """Loads article records from a JSON Lines file.
+
+    Args:
+        path: Path to ``articles.jsonl`` or another compatible JSONL file.
+
+    Returns:
+        Article records loaded from the file.
+    """
+    articles: list[ArticleRecord] = []
+    with open(path, encoding="utf-8") as file:
+        for line in file:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            articles.append(
+                ArticleRecord(
+                    date=str(item["date"]),
+                    title=str(item["title"]),
+                    url=str(item["url"]),
+                )
+            )
+    return articles
+
+
+def filter_articles_by_date(
+    articles: Iterable[ArticleRecord],
+    start_date: str,
+    end_date: str,
+) -> list[ArticleRecord]:
+    """Filters articles by inclusive ``MMDD`` date range.
+
+    Args:
+        articles: Article records to filter.
+        start_date: Inclusive start date in ``MMDD`` format.
+        end_date: Inclusive end date in ``MMDD`` format.
+
+    Returns:
+        Articles whose date falls within the requested range.
+    """
+    return [
+        article
+        for article in articles
+        if start_date <= article.date <= end_date
+    ]
+
+
 def write_article_outputs(entry: IndexEntry, articles_path: str, popular_path: str) -> None:
     """Writes an article to crawl outputs, including popular output if needed.
 
@@ -453,6 +510,166 @@ def print_crawl_summary(stats: CrawlStats, articles_path: str, popular_path: str
     print(f"- elapsed time: {elapsed}", flush=True)
 
 
+def extract_push_counts(soup: BeautifulSoup) -> tuple[Counter[str], Counter[str]]:
+    """Extracts push and boo user counters from one article page.
+
+    Args:
+        soup: A BeautifulSoup document for an article page.
+
+    Returns:
+        A tuple ``(push_counter, boo_counter)`` keyed by user ID.
+    """
+    push_counter: Counter[str] = Counter()
+    boo_counter: Counter[str] = Counter()
+
+    for push_node in soup.select("div.push"):
+        tag_node = push_node.select_one("span.push-tag")
+        user_node = push_node.select_one("span.push-userid")
+        if tag_node is None or user_node is None:
+            continue
+
+        tag = tag_node.get_text(strip=True)
+        user_id = user_node.get_text()
+        if tag == "推":
+            push_counter[user_id] += 1
+        elif tag == "噓":
+            boo_counter[user_id] += 1
+
+    return push_counter, boo_counter
+
+
+def merge_counters(target: Counter[str], source: Counter[str]) -> None:
+    """Adds counts from one counter into another counter.
+
+    Args:
+        target: Counter to mutate.
+        source: Counter whose counts should be added.
+    """
+    target.update(source)
+
+
+def format_top10(counter: Counter[str]) -> list[dict[str, int | str]]:
+    """Formats the top 10 entries from a user counter.
+
+    Args:
+        counter: Counter keyed by user ID.
+
+    Returns:
+        A list of ``{"user_id": user_id, "count": count}`` dictionaries.
+    """
+    return [
+        {"user_id": user_id, "count": count}
+        for user_id, count in counter.most_common(10)
+    ]
+
+
+def write_json(path: str, item: dict) -> None:
+    """Writes a JSON object to disk.
+
+    Args:
+        path: Output JSON path.
+        item: JSON-serializable object to write.
+    """
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(item, file, ensure_ascii=False, indent=2)
+
+
+def print_push_status(processed: int, total: int, article: ArticleRecord) -> None:
+    """Prints a compact push-processing progress line.
+
+    Args:
+        processed: Number of processed articles.
+        total: Total number of articles to process.
+        article: The current article being processed.
+    """
+    if not sys.stderr.isatty():
+        return
+    message = (
+        f"[push] {processed}/{total} date={article.date} "
+        f"url={article.url}"
+    )
+    sys.stderr.write("\r\033[K" + message)
+    sys.stderr.flush()
+
+
+def print_push_summary(
+    output_path: str,
+    article_count: int,
+    push_total: int,
+    boo_total: int,
+    started_at: float,
+) -> None:
+    """Prints the final push summary.
+
+    Args:
+        output_path: Path to the generated push JSON file.
+        article_count: Number of articles processed.
+        push_total: Total push comments counted.
+        boo_total: Total boo comments counted.
+        started_at: Monotonic start time of the push command.
+    """
+    if sys.stderr.isatty():
+        sys.stderr.write("\r\033[K")
+        sys.stderr.flush()
+    elapsed = format_elapsed(time.monotonic() - started_at)
+    print("Push summary", flush=True)
+    print(f"- articles processed: {article_count}", flush=True)
+    print(f"- push total: {push_total}", flush=True)
+    print(f"- boo total: {boo_total}", flush=True)
+    print(f"- output file: {output_path}", flush=True)
+    print(f"- elapsed time: {elapsed}", flush=True)
+
+
+def push(start_date: str, end_date: str, output_dir: str = ".") -> None:
+    """Computes push and boo statistics for a date range.
+
+    Args:
+        start_date: Inclusive start date in ``MMDD`` format.
+        end_date: Inclusive end date in ``MMDD`` format.
+        output_dir: Directory containing ``articles.jsonl`` and receiving the
+            generated ``push_{start_date}_{end_date}.json`` file.
+    """
+    started_at = time.monotonic()
+    articles_path = os.path.join(output_dir, "articles.jsonl")
+    output_path = os.path.join(output_dir, f"push_{start_date}_{end_date}.json")
+    articles = filter_articles_by_date(
+        load_articles(articles_path),
+        start_date,
+        end_date,
+    )
+
+    push_counter: Counter[str] = Counter()
+    boo_counter: Counter[str] = Counter()
+    total = len(articles)
+
+    for index, article in enumerate(articles, start=1):
+        print_push_status(index, total, article)
+        article_push_counter, article_boo_counter = extract_push_counts(
+            fetch_soup(article.url)
+        )
+        merge_counters(push_counter, article_push_counter)
+        merge_counters(boo_counter, article_boo_counter)
+
+    output = {
+        "push": {
+            "total": sum(push_counter.values()),
+            "top10": format_top10(push_counter),
+        },
+        "boo": {
+            "total": sum(boo_counter.values()),
+            "top10": format_top10(boo_counter),
+        },
+    }
+    write_json(output_path, output)
+    print_push_summary(
+        output_path,
+        total,
+        output["push"]["total"],
+        output["boo"]["total"],
+        started_at,
+    )
+
+
 def should_collect_entry(entry: IndexEntry, seen_jan_first: bool) -> tuple[bool, bool]:
     """Decides whether to collect an entry after crawl has entered 2025.
 
@@ -571,19 +788,42 @@ def parse_args() -> argparse.Namespace:
     Returns:
         The parsed argparse namespace.
     """
-    parser = argparse.ArgumentParser(description="Crawl PTT Stock 2025 articles.")
-    parser.add_argument(
+    parser = argparse.ArgumentParser(description="PTT Stock HW4 crawler.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    crawl_parser = subparsers.add_parser(
+        "crawl",
+        help="Crawl 2025 PTT Stock articles.",
+    )
+    crawl_parser.add_argument(
         "--output-dir",
         default=".",
         help="Directory for articles.jsonl and popular_articles.jsonl.",
+    )
+
+    push_parser = subparsers.add_parser(
+        "push",
+        help="Compute push and boo statistics for a date range.",
+    )
+    push_parser.add_argument("start_date", help="Inclusive start date in MMDD format.")
+    push_parser.add_argument("end_date", help="Inclusive end date in MMDD format.")
+    push_parser.add_argument(
+        "--output-dir",
+        default=".",
+        help="Directory containing articles.jsonl and receiving push output.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
-    """Runs the crawl command-line entry point."""
+    """Runs the command-line entry point."""
     args = parse_args()
-    crawl(args.output_dir)
+    if args.command in (None, "crawl"):
+        crawl(args.output_dir)
+    elif args.command == "push":
+        push(args.start_date, args.end_date, args.output_dir)
+    else:
+        raise ValueError(f"Unsupported command: {args.command}")
 
 
 if __name__ == "__main__":
