@@ -763,6 +763,138 @@ def popular(start_date: str, end_date: str, output_dir: str = ".") -> None:
     print_popular_summary(output_path, total, len(image_urls), started_at)
 
 
+def extract_keyword_search_text(soup: BeautifulSoup) -> str | None:
+    """Extracts the article text range used for keyword matching.
+
+    The assignment defines the searchable range as starting from ``作者``
+    inclusive and ending before ``※ 發信站``. Articles without ``※ 發信站`` are
+    ignored.
+
+    Args:
+        soup: A BeautifulSoup document for an article page.
+
+    Returns:
+        The searchable article text, or ``None`` if the required range cannot
+        be found.
+    """
+    main_content = soup.select_one("#main-content")
+    text = main_content.get_text("\n") if main_content else soup.get_text("\n")
+    start = text.find("作者")
+    end = text.find("※ 發信站")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return text[start:end]
+
+
+def article_matches_keyword(soup: BeautifulSoup, keyword: str) -> bool:
+    """Checks whether an article page matches a keyword.
+
+    Args:
+        soup: A BeautifulSoup document for an article page.
+        keyword: Keyword to search for.
+
+    Returns:
+        ``True`` when the keyword appears in the assignment-defined article
+        body range, otherwise ``False``.
+    """
+    search_text = extract_keyword_search_text(soup)
+    return search_text is not None and keyword in search_text
+
+
+def print_keyword_status(processed: int, total: int, matched: int, article: ArticleRecord) -> None:
+    """Prints a compact keyword-processing progress line.
+
+    Args:
+        processed: Number of processed articles.
+        total: Total number of articles to process.
+        matched: Number of keyword-matched articles so far.
+        article: The current article being processed.
+    """
+    if not sys.stderr.isatty():
+        return
+    message = (
+        f"[keyword] {processed}/{total} matched={matched} "
+        f"date={article.date} url={article.url}"
+    )
+    sys.stderr.write("\r\033[K" + message)
+    sys.stderr.flush()
+
+
+def print_keyword_summary(
+    output_path: str,
+    article_count: int,
+    matched_count: int,
+    image_count: int,
+    started_at: float,
+) -> None:
+    """Prints the final keyword summary.
+
+    Args:
+        output_path: Path to the generated keyword JSON file.
+        article_count: Number of articles processed.
+        matched_count: Number of articles matching the keyword.
+        image_count: Number of extracted image URLs.
+        started_at: Monotonic start time of the keyword command.
+    """
+    if sys.stderr.isatty():
+        sys.stderr.write("\r\033[K")
+        sys.stderr.flush()
+    elapsed = format_elapsed(time.monotonic() - started_at)
+    print("Keyword summary", flush=True)
+    print(f"- articles processed: {article_count}", flush=True)
+    print(f"- matched articles: {matched_count}", flush=True)
+    print(f"- image URLs extracted: {image_count}", flush=True)
+    print(f"- output file: {output_path}", flush=True)
+    print(f"- elapsed time: {elapsed}", flush=True)
+
+
+def keyword(start_date: str, end_date: str, search_keyword: str, output_dir: str = ".") -> None:
+    """Extracts image URLs from articles whose body contains a keyword.
+
+    Args:
+        start_date: Inclusive start date in ``MMDD`` format.
+        end_date: Inclusive end date in ``MMDD`` format.
+        search_keyword: Keyword to match inside the assignment-defined article
+            body range.
+        output_dir: Directory containing ``articles.jsonl`` and receiving the
+            generated keyword output JSON file.
+    """
+    started_at = time.monotonic()
+    articles_path = os.path.join(output_dir, "articles.jsonl")
+    output_path = os.path.join(
+        output_dir,
+        f"keyword_{start_date}_{end_date}_{search_keyword}.json",
+    )
+    articles = filter_articles_by_date(
+        load_articles(articles_path),
+        start_date,
+        end_date,
+    )
+
+    image_urls: list[str] = []
+    matched_count = 0
+    total = len(articles)
+
+    for index, article in enumerate(articles, start=1):
+        print_keyword_status(index, total, matched_count, article)
+        soup = fetch_soup(article.url)
+        if not article_matches_keyword(soup, search_keyword):
+            continue
+        matched_count += 1
+        image_urls.extend(extract_image_urls(soup))
+        print_keyword_status(index, total, matched_count, article)
+
+    output = {"image_urls": image_urls}
+    write_json(output_path, output)
+    print_keyword_summary(
+        output_path,
+        total,
+        matched_count,
+        len(image_urls),
+        started_at,
+    )
+
+
 def should_collect_entry(entry: IndexEntry, seen_jan_first: bool) -> tuple[bool, bool]:
     """Decides whether to collect an entry after crawl has entered 2025.
 
@@ -920,6 +1052,19 @@ def parse_args() -> argparse.Namespace:
             "popular output."
         ),
     )
+
+    keyword_parser = subparsers.add_parser(
+        "keyword",
+        help="Extract image URLs from articles whose body contains a keyword.",
+    )
+    keyword_parser.add_argument("start_date", help="Inclusive start date in MMDD format.")
+    keyword_parser.add_argument("end_date", help="Inclusive end date in MMDD format.")
+    keyword_parser.add_argument("keyword", help="Keyword without whitespace.")
+    keyword_parser.add_argument(
+        "--output-dir",
+        default=".",
+        help="Directory containing articles.jsonl and receiving keyword output.",
+    )
     return parser.parse_args()
 
 
@@ -932,6 +1077,8 @@ def main() -> None:
         push(args.start_date, args.end_date, args.output_dir)
     elif args.command == "popular":
         popular(args.start_date, args.end_date, args.output_dir)
+    elif args.command == "keyword":
+        keyword(args.start_date, args.end_date, args.keyword, args.output_dir)
     else:
         raise ValueError(f"Unsupported command: {args.command}")
 
