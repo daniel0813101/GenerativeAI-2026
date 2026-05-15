@@ -1014,7 +1014,7 @@ def parse_args() -> argparse.Namespace:
         The parsed argparse namespace.
     """
     parser = argparse.ArgumentParser(description="PTT Stock HW4 crawler.")
-    subparsers = parser.add_subparsers(dest="command")
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
     crawl_parser = subparsers.add_parser(
         "crawl",
@@ -1071,7 +1071,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Runs the command-line entry point."""
     args = parse_args()
-    if args.command in (None, "crawl"):
+    if args.command == "crawl":
         crawl(args.output_dir)
     elif args.command == "push":
         push(args.start_date, args.end_date, args.output_dir)
