@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
 
-from common import (
+from utils import (
     IMAGE_SIZE,
     VAE_MODEL_ID,
     EMAModel,
@@ -26,6 +26,31 @@ from common import (
 
 @dataclass
 class TrainConfig:
+    """Hyperparameters and paths used by the HW5 training script.
+
+    Attributes:
+        image_dir: Directory containing 256x256 RGB training PNG images.
+        latent_cache: Path where encoded VAE latents are stored.
+        output_dir: Directory used for checkpoints and training metadata.
+        rebuild_cache: Whether to overwrite an existing latent cache.
+        augment_cache: Whether to horizontally augment images during caching.
+        epochs: Number of epochs to train when max_steps is unset.
+        max_steps: Explicit optimizer update count. Uses epochs when set to 0.
+        batch_size: Latent training batch size.
+        encode_batch_size: Image batch size used for VAE latent caching.
+        grad_accum_steps: Number of backward passes per optimizer update.
+        lr: AdamW learning rate.
+        weight_decay: AdamW weight decay.
+        warmup_steps: Linear warmup steps before cosine LR decay.
+        ema_decay: Exponential moving average decay for checkpoint export.
+        max_grad_norm: Gradient clipping norm. Disabled when <= 0.
+        save_every: Optimizer update interval for checkpoint saves.
+        num_workers: DataLoader worker count.
+        seed: Random seed for Python, NumPy, and PyTorch.
+        mixed_precision: Whether to use CUDA AMP during training.
+        device: Torch device string, usually "cuda" or "cpu".
+    """
+
     image_dir: str = "HW5/public_data/images"
     latent_cache: str = "HW5/model/cache/latents.pt"
     output_dir: str = "HW5/model/baseline_latent_ddpm"
@@ -49,7 +74,19 @@ class TrainConfig:
 
 
 class ImageDataset(Dataset):
+    """Loads and normalizes professor face images for VAE encoding."""
+
     def __init__(self, image_dir: Path, image_size: int = IMAGE_SIZE, augment: bool = True):
+        """Initializes the image dataset.
+
+        Args:
+            image_dir: Directory containing PNG training images.
+            image_size: Output square image size expected by the VAE.
+            augment: Whether to apply random horizontal flips.
+
+        Raises:
+            FileNotFoundError: If no PNG images are found in image_dir.
+        """
         self.image_paths = sorted(p for p in image_dir.glob("*.png") if p.is_file())
         if not self.image_paths:
             raise FileNotFoundError(f"No PNG images found under {image_dir}")
@@ -65,27 +102,58 @@ class ImageDataset(Dataset):
         )
 
     def __len__(self) -> int:
+        """Returns the number of available training images."""
         return len(self.image_paths)
 
     def __getitem__(self, index: int) -> torch.Tensor:
+        """Loads one image and returns it normalized to [-1, 1].
+
+        Args:
+            index: Image index.
+
+        Returns:
+            A transformed RGB image tensor with shape (3, image_size, image_size).
+        """
         image = Image.open(self.image_paths[index]).convert("RGB")
         return self.transform(image)
 
 
 class LatentDataset(Dataset):
+    """Loads cached VAE latents for diffusion training."""
+
     def __init__(self, latent_path: Path):
+        """Initializes the latent dataset.
+
+        Args:
+            latent_path: Path to a torch file containing a "latents" tensor.
+        """
         payload = torch.load(latent_path, map_location="cpu")
         self.latents = payload["latents"].float()
 
     def __len__(self) -> int:
+        """Returns the number of cached latent samples."""
         return self.latents.shape[0]
 
     def __getitem__(self, index: int) -> torch.Tensor:
+        """Returns one cached latent tensor.
+
+        Args:
+            index: Latent index.
+
+        Returns:
+            A latent tensor with shape (4, 32, 32).
+        """
         return self.latents[index]
 
 
 @torch.no_grad()
 def cache_latents(config: TrainConfig, device: torch.device) -> None:
+    """Encodes training images into VAE latent space and saves a cache.
+
+    Args:
+        config: Training configuration with image and cache paths.
+        device: Device used to run the pretrained VAE encoder.
+    """
     latent_path = Path(config.latent_cache)
     if latent_path.exists() and not config.rebuild_cache:
         print(f"Using existing latent cache: {latent_path}")
@@ -125,6 +193,15 @@ def cache_latents(config: TrainConfig, device: torch.device) -> None:
 
 
 def build_lr_lambda(warmup_steps: int, total_steps: int):
+    """Builds a warmup plus cosine decay learning-rate schedule.
+
+    Args:
+        warmup_steps: Number of linear warmup optimizer updates.
+        total_steps: Total number of optimizer updates.
+
+    Returns:
+        A LambdaLR-compatible function mapping step index to LR scale.
+    """
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return max(step, 1) / max(warmup_steps, 1)
@@ -135,6 +212,15 @@ def build_lr_lambda(warmup_steps: int, total_steps: int):
 
 
 def save_checkpoint(unet, ema, output_dir: Path, step: int, config: TrainConfig) -> None:
+    """Saves raw and EMA U-Net checkpoints for a training step.
+
+    Args:
+        unet: Current denoising U-Net.
+        ema: EMA tracker containing smoothed U-Net parameters.
+        output_dir: Parent directory where checkpoint folders are written.
+        step: Current optimizer update step.
+        config: Training configuration to record in checkpoint metadata.
+    """
     step_dir = output_dir / f"unet_step_{step:07d}"
     ema_dir = output_dir / f"unet_ema_step_{step:07d}"
     unet.save_pretrained(step_dir)
@@ -158,6 +244,11 @@ def save_checkpoint(unet, ema, output_dir: Path, step: int, config: TrainConfig)
 
 
 def train(config: TrainConfig) -> None:
+    """Trains the from-scratch latent DDPM denoising U-Net.
+
+    Args:
+        config: Training hyperparameters, paths, and runtime settings.
+    """
     seed_everything(config.seed)
     device = torch.device(config.device)
 
@@ -246,6 +337,11 @@ def train(config: TrainConfig) -> None:
 
 
 def parse_args() -> TrainConfig:
+    """Parses CLI overrides into a TrainConfig instance.
+
+    Returns:
+        TrainConfig populated from dataclass defaults and command-line flags.
+    """
     defaults = TrainConfig()
     parser = argparse.ArgumentParser(description="Train legal HW5 latent-DDPM baseline from scratch.")
     parser.add_argument("--image_dir", type=str, default=defaults.image_dir)

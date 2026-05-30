@@ -14,6 +14,11 @@ IMAGE_SIZE = 256
 
 
 def seed_everything(seed: int) -> None:
+    """Sets random seeds for reproducible training and sampling.
+
+    Args:
+        seed: Seed used for Python, NumPy, CPU torch, and CUDA torch RNGs.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -21,6 +26,11 @@ def seed_everything(seed: int) -> None:
 
 
 def build_unet() -> UNet2DModel:
+    """Builds the from-scratch latent denoising U-Net.
+
+    Returns:
+        A diffusers UNet2DModel configured for 4-channel 32x32 VAE latents.
+    """
     return UNet2DModel(
         sample_size=LATENT_SIZE,
         in_channels=LATENT_CHANNELS,
@@ -43,6 +53,11 @@ def build_unet() -> UNet2DModel:
 
 
 def build_train_scheduler() -> DDPMScheduler:
+    """Builds the DDPM scheduler shared by training and inference samplers.
+
+    Returns:
+        A DDPMScheduler configured to train epsilon prediction on VAE latents.
+    """
     return DDPMScheduler(
         num_train_timesteps=1000,
         beta_start=0.00085,
@@ -54,13 +69,27 @@ def build_train_scheduler() -> DDPMScheduler:
 
 
 def save_json(path: Path, data: dict) -> None:
+    """Writes a dictionary to a formatted JSON file.
+
+    Args:
+        path: Destination JSON path. Parent directories are created if needed.
+        data: JSON-serializable dictionary to save.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True)
 
 
 class EMAModel:
+    """Tracks an exponential moving average of trainable model parameters."""
+
     def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
+        """Initializes EMA shadow parameters from a model.
+
+        Args:
+            model: Model whose trainable parameters should be tracked.
+            decay: EMA decay factor. Higher values update the shadow weights slower.
+        """
         self.decay = decay
         self.shadow = {
             name: param.detach().clone()
@@ -70,20 +99,40 @@ class EMAModel:
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module) -> None:
+        """Updates shadow parameters from the current model weights.
+
+        Args:
+            model: Model providing the latest trainable parameters.
+        """
         for name, param in model.named_parameters():
             if name not in self.shadow:
                 continue
             self.shadow[name].mul_(self.decay).add_(param.detach(), alpha=1.0 - self.decay)
 
     def copy_to(self, model: torch.nn.Module) -> None:
+        """Copies EMA shadow parameters into a model.
+
+        Args:
+            model: Destination model with matching parameter names and shapes.
+        """
         model_state = model.state_dict()
         for name, value in self.shadow.items():
             if name in model_state:
                 model_state[name].copy_(value)
 
     def state_dict(self) -> dict:
+        """Returns EMA state for checkpoint serialization.
+
+        Returns:
+            A dictionary containing the EMA decay and shadow parameters.
+        """
         return {"decay": self.decay, "shadow": self.shadow}
 
     def load_state_dict(self, state: dict) -> None:
+        """Loads EMA state from a checkpoint dictionary.
+
+        Args:
+            state: Dictionary produced by state_dict().
+        """
         self.decay = state["decay"]
         self.shadow = state["shadow"]

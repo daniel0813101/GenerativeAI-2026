@@ -7,11 +7,25 @@ from diffusers import AutoencoderKL, DDIMScheduler, DDPMScheduler, DPMSolverMult
 from torchvision import transforms
 from tqdm import tqdm
 
-from common import LATENT_CHANNELS, LATENT_SIZE, VAE_MODEL_ID, build_train_scheduler, seed_everything
+from utils import LATENT_CHANNELS, LATENT_SIZE, VAE_MODEL_ID, build_train_scheduler, seed_everything
 
 
 @dataclass
 class InferenceConfig:
+    """Hyperparameters and paths used by the HW5 inference script.
+
+    Attributes:
+        checkpoint_dir: Directory containing the trained U-Net checkpoint.
+        output_dir: Directory where generated PNG images are written.
+        num_samples: Number of images to generate.
+        batch_size: Number of latent samples generated per batch.
+        sampler: Reverse diffusion sampler name: "ddpm", "ddim", or "dpm".
+        num_inference_steps: Number of denoising steps used by the sampler.
+        seed: Random seed for reproducible sampling.
+        clean_output: Whether to delete existing PNG files in output_dir first.
+        device: Torch device string, usually "cuda" or "cpu".
+    """
+
     checkpoint_dir: str = "HW5/model/baseline_latent_ddpm/unet_ema_final"
     output_dir: str = "HW5/scoring_program/input/res"
     num_samples: int = 3000
@@ -24,6 +38,18 @@ class InferenceConfig:
 
 
 def build_sampler(name: str, num_steps: int):
+    """Creates a scheduler for reverse diffusion sampling.
+
+    Args:
+        name: Sampler type. Must be "ddpm", "ddim", or "dpm".
+        num_steps: Number of inference timesteps to run.
+
+    Returns:
+        A configured diffusers scheduler with timesteps initialized.
+
+    Raises:
+        ValueError: If name does not match a supported sampler.
+    """
     base = build_train_scheduler()
     if name == "ddpm":
         scheduler = DDPMScheduler.from_config(base.config)
@@ -39,6 +65,11 @@ def build_sampler(name: str, num_steps: int):
 
 @torch.no_grad()
 def generate(config: InferenceConfig) -> None:
+    """Generates 256x256 PNG images from random latent noise.
+
+    Args:
+        config: Inference hyperparameters, checkpoint path, and output path.
+    """
     seed_everything(config.seed)
     device = torch.device(config.device)
     output_dir = Path(config.output_dir)
@@ -89,6 +120,11 @@ def generate(config: InferenceConfig) -> None:
 
 
 def parse_args() -> InferenceConfig:
+    """Parses CLI overrides into an InferenceConfig instance.
+
+    Returns:
+        InferenceConfig populated from dataclass defaults and command-line flags.
+    """
     defaults = InferenceConfig()
     parser = argparse.ArgumentParser(description="Generate 256x256 HW5 result PNGs.")
     parser.add_argument("--checkpoint_dir", type=str, default=defaults.checkpoint_dir)
