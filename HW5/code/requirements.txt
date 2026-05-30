@@ -1,0 +1,9 @@
+torch
+torchvision
+diffusers
+transformers
+numpy
+scipy
+tqdm
+Pillow
+open_clip_torch
