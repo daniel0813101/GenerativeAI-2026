@@ -1,6 +1,7 @@
 import argparse
 import math
 import shutil
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
@@ -21,6 +22,30 @@ from common import (
     save_json,
     seed_everything,
 )
+
+
+@dataclass
+class TrainConfig:
+    image_dir: str = "HW5/public_data/images"
+    latent_cache: str = "HW5/model/cache/latents.pt"
+    output_dir: str = "HW5/model/baseline_latent_ddpm"
+    rebuild_cache: bool = False
+    augment_cache: bool = False
+    epochs: int = 350
+    max_steps: int = 0
+    batch_size: int = 64
+    encode_batch_size: int = 32
+    grad_accum_steps: int = 1
+    lr: float = 1e-4
+    weight_decay: float = 1e-4
+    warmup_steps: int = 500
+    ema_decay: float = 0.9999
+    max_grad_norm: float = 1.0
+    save_every: int = 5000
+    num_workers: int = 4
+    seed: int = 42
+    mixed_precision: bool = False
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 class ImageDataset(Dataset):
@@ -60,18 +85,18 @@ class LatentDataset(Dataset):
 
 
 @torch.no_grad()
-def cache_latents(args, device: torch.device) -> None:
-    latent_path = Path(args.latent_cache)
-    if latent_path.exists() and not args.rebuild_cache:
+def cache_latents(config: TrainConfig, device: torch.device) -> None:
+    latent_path = Path(config.latent_cache)
+    if latent_path.exists() and not config.rebuild_cache:
         print(f"Using existing latent cache: {latent_path}")
         return
 
-    dataset = ImageDataset(Path(args.image_dir), augment=args.augment_cache)
+    dataset = ImageDataset(Path(config.image_dir), augment=config.augment_cache)
     dataloader = DataLoader(
         dataset,
-        batch_size=args.encode_batch_size,
+        batch_size=config.encode_batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=config.num_workers,
         pin_memory=device.type == "cuda",
     )
 
@@ -91,8 +116,8 @@ def cache_latents(args, device: torch.device) -> None:
         {
             "latents": torch.cat(latents, dim=0),
             "vae": VAE_MODEL_ID,
-            "image_dir": str(args.image_dir),
-            "augmented": args.augment_cache,
+            "image_dir": str(config.image_dir),
+            "augmented": config.augment_cache,
         },
         latent_path,
     )
@@ -109,7 +134,7 @@ def build_lr_lambda(warmup_steps: int, total_steps: int):
     return lr_lambda
 
 
-def save_checkpoint(unet, ema, output_dir: Path, step: int, args) -> None:
+def save_checkpoint(unet, ema, output_dir: Path, step: int, config: TrainConfig) -> None:
     step_dir = output_dir / f"unet_step_{step:07d}"
     ema_dir = output_dir / f"unet_ema_step_{step:07d}"
     unet.save_pretrained(step_dir)
@@ -126,44 +151,44 @@ def save_checkpoint(unet, ema, output_dir: Path, step: int, args) -> None:
             "step": step,
             "raw_checkpoint": str(step_dir),
             "ema_checkpoint": str(ema_dir),
-            "latent_cache": args.latent_cache,
+            "latent_cache": config.latent_cache,
         },
     )
     print(f"Saved checkpoints at step {step}")
 
 
-def train(args) -> None:
-    seed_everything(args.seed)
-    device = torch.device(args.device)
+def train(config: TrainConfig) -> None:
+    seed_everything(config.seed)
+    device = torch.device(config.device)
 
-    cache_latents(args, device)
-    dataset = LatentDataset(Path(args.latent_cache))
+    cache_latents(config, device)
+    dataset = LatentDataset(Path(config.latent_cache))
     dataloader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=config.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=config.num_workers,
         pin_memory=device.type == "cuda",
         drop_last=True,
     )
 
     unet = build_unet().to(device)
     unet.train()
-    ema = EMAModel(unet, decay=args.ema_decay)
+    ema = EMAModel(unet, decay=config.ema_decay)
     scheduler = build_train_scheduler()
-    optimizer = AdamW(unet.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay)
+    optimizer = AdamW(unet.parameters(), lr=config.lr, betas=(0.9, 0.999), weight_decay=config.weight_decay)
 
-    updates_per_epoch = math.ceil(len(dataloader) / args.grad_accum_steps)
-    total_steps = args.max_steps or args.epochs * updates_per_epoch
+    updates_per_epoch = math.ceil(len(dataloader) / config.grad_accum_steps)
+    total_steps = config.max_steps or config.epochs * updates_per_epoch
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, build_lr_lambda(args.warmup_steps, total_steps)
+        optimizer, build_lr_lambda(config.warmup_steps, total_steps)
     )
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_json(output_dir / "train_config.json", vars(args))
+    save_json(output_dir / "train_config.json", asdict(config))
 
-    scaler = torch.cuda.amp.GradScaler(enabled=args.mixed_precision and device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=config.mixed_precision and device.type == "cuda")
     step = 0
     accum_step = 0
     optimizer.zero_grad(set_to_none=True)
@@ -182,17 +207,17 @@ def train(args) -> None:
             )
             noisy_latents = scheduler.add_noise(latents, noise, timesteps)
 
-            with torch.cuda.amp.autocast(enabled=args.mixed_precision and device.type == "cuda"):
+            with torch.cuda.amp.autocast(enabled=config.mixed_precision and device.type == "cuda"):
                 pred = unet(noisy_latents, timesteps).sample
-                loss = F.mse_loss(pred.float(), noise.float()) / args.grad_accum_steps
+                loss = F.mse_loss(pred.float(), noise.float()) / config.grad_accum_steps
 
             scaler.scale(loss).backward()
             accum_step += 1
 
-            if accum_step % args.grad_accum_steps == 0:
-                if args.max_grad_norm > 0:
+            if accum_step % config.grad_accum_steps == 0:
+                if config.max_grad_norm > 0:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(unet.parameters(), config.max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -202,10 +227,10 @@ def train(args) -> None:
                 step += 1
                 accum_step = 0
                 pbar.update(1)
-                pbar.set_postfix(loss=f"{loss.item() * args.grad_accum_steps:.4f}", lr=lr_scheduler.get_last_lr()[0])
+                pbar.set_postfix(loss=f"{loss.item() * config.grad_accum_steps:.4f}", lr=lr_scheduler.get_last_lr()[0])
 
-                if step % args.save_every == 0 or step == total_steps:
-                    save_checkpoint(unet, ema, output_dir, step, args)
+                if step % config.save_every == 0 or step == total_steps:
+                    save_checkpoint(unet, ema, output_dir, step, config)
 
                 if step >= total_steps:
                     break
@@ -220,29 +245,30 @@ def train(args) -> None:
     print(f"Saved final EMA model to {final_dir}")
 
 
-def parse_args():
+def parse_args() -> TrainConfig:
+    defaults = TrainConfig()
     parser = argparse.ArgumentParser(description="Train legal HW5 latent-DDPM baseline from scratch.")
-    parser.add_argument("--image_dir", type=str, default="HW5/public_data/images")
-    parser.add_argument("--latent_cache", type=str, default="HW5/model/cache/latents.pt")
-    parser.add_argument("--output_dir", type=str, default="HW5/model/baseline_latent_ddpm")
-    parser.add_argument("--rebuild_cache", action="store_true")
-    parser.add_argument("--augment_cache", action="store_true", help="Cache one horizontally-augmented pass. Usually keep off.")
-    parser.add_argument("--epochs", type=int, default=350)
-    parser.add_argument("--max_steps", type=int, default=0)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--encode_batch_size", type=int, default=32)
-    parser.add_argument("--grad_accum_steps", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--warmup_steps", type=int, default=500)
-    parser.add_argument("--ema_decay", type=float, default=0.9999)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--save_every", type=int, default=5000)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--mixed_precision", action="store_true")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    return parser.parse_args()
+    parser.add_argument("--image_dir", type=str, default=defaults.image_dir)
+    parser.add_argument("--latent_cache", type=str, default=defaults.latent_cache)
+    parser.add_argument("--output_dir", type=str, default=defaults.output_dir)
+    parser.add_argument("--rebuild_cache", action="store_true", default=defaults.rebuild_cache)
+    parser.add_argument("--augment_cache", action="store_true", default=defaults.augment_cache, help="Cache one horizontally-augmented pass. Usually keep off.")
+    parser.add_argument("--epochs", type=int, default=defaults.epochs)
+    parser.add_argument("--max_steps", type=int, default=defaults.max_steps)
+    parser.add_argument("--batch_size", type=int, default=defaults.batch_size)
+    parser.add_argument("--encode_batch_size", type=int, default=defaults.encode_batch_size)
+    parser.add_argument("--grad_accum_steps", type=int, default=defaults.grad_accum_steps)
+    parser.add_argument("--lr", type=float, default=defaults.lr)
+    parser.add_argument("--weight_decay", type=float, default=defaults.weight_decay)
+    parser.add_argument("--warmup_steps", type=int, default=defaults.warmup_steps)
+    parser.add_argument("--ema_decay", type=float, default=defaults.ema_decay)
+    parser.add_argument("--max_grad_norm", type=float, default=defaults.max_grad_norm)
+    parser.add_argument("--save_every", type=int, default=defaults.save_every)
+    parser.add_argument("--num_workers", type=int, default=defaults.num_workers)
+    parser.add_argument("--seed", type=int, default=defaults.seed)
+    parser.add_argument("--mixed_precision", action="store_true", default=defaults.mixed_precision)
+    parser.add_argument("--device", type=str, default=defaults.device)
+    return TrainConfig(**vars(parser.parse_args()))
 
 
 if __name__ == "__main__":
