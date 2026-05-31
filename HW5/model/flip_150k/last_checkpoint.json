@@ -1,0 +1,6 @@
+{
+  "ema_checkpoint": "HW5/model/flip_150k/unet_ema_step_0135000",
+  "latent_cache": "HW5/model/cache/latents_flip_pairs.pt",
+  "raw_checkpoint": "HW5/model/flip_150k/unet_step_0135000",
+  "step": 135000
+}

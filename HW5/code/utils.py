@@ -25,18 +25,27 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def build_unet() -> UNet2DModel:
+def build_unet(block_out_channels: tuple[int, ...] = (128, 256, 512, 512)) -> UNet2DModel:
     """Builds the from-scratch latent denoising U-Net.
+
+    Args:
+        block_out_channels: Channel widths for the four U-Net resolution stages.
 
     Returns:
         A diffusers UNet2DModel configured for 4-channel 32x32 VAE latents.
+
+    Raises:
+        ValueError: If block_out_channels does not contain four widths.
     """
+    if len(block_out_channels) != 4:
+        raise ValueError("block_out_channels must contain exactly four channel widths")
+
     return UNet2DModel(
         sample_size=LATENT_SIZE,
         in_channels=LATENT_CHANNELS,
         out_channels=LATENT_CHANNELS,
         layers_per_block=2,
-        block_out_channels=(128, 256, 512, 512),
+        block_out_channels=block_out_channels,
         down_block_types=(
             "DownBlock2D",
             "DownBlock2D",

@@ -20,6 +20,32 @@ The final EMA checkpoint is saved to:
 HW5/model/baseline_latent_ddpm/unet_ema_final
 ```
 
+Flip-pair latent cache experiment:
+
+```bash
+python HW5/code/train.py \
+  --mixed_precision \
+  --rebuild_cache \
+  --cache_flip_pairs \
+  --latent_cache HW5/model/cache/latents_flip_pairs.pt \
+  --max_steps 150000 \
+  --save_every 15000 \
+  --output_dir HW5/model/flip_150k
+```
+
+This caches both original and horizontally flipped VAE latents, doubling the training latent count while keeping the baseline cache separate.
+
+Large U-Net experiment without flip augmentation:
+
+```bash
+python HW5/code/train.py \
+  --mixed_precision \
+  --unet_channels 128,256,512,768 \
+  --max_steps 150000 \
+  --save_every 15000 \
+  --output_dir HW5/model/unet_large_150k
+```
+
 ## Generate
 
 ```bash

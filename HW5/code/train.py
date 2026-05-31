@@ -33,7 +33,9 @@ class TrainConfig:
         latent_cache: Path where encoded VAE latents are stored.
         output_dir: Directory used for checkpoints and training metadata.
         rebuild_cache: Whether to overwrite an existing latent cache.
-        augment_cache: Whether to horizontally augment images during caching.
+        augment_cache: Whether to randomly horizontally augment one cache pass.
+        cache_flip_pairs: Whether to cache both original and horizontally flipped latents.
+        unet_channels: Comma-separated U-Net channel widths for four resolution stages.
         epochs: Number of epochs to train when max_steps is unset.
         max_steps: Explicit optimizer update count. Uses epochs when set to 0.
         batch_size: Latent training batch size.
@@ -56,6 +58,8 @@ class TrainConfig:
     output_dir: str = "HW5/model/baseline_latent_ddpm"
     rebuild_cache: bool = False
     augment_cache: bool = False
+    cache_flip_pairs: bool = False
+    unet_channels: str = "128,256,512,512"
     epochs: int = 350
     max_steps: int = 0
     batch_size: int = 64
@@ -146,6 +150,28 @@ class LatentDataset(Dataset):
         return self.latents[index]
 
 
+def parse_unet_channels(value: str) -> tuple[int, ...]:
+    """Parses a comma-separated U-Net channel specification.
+
+    Args:
+        value: Comma-separated channel widths, such as "128,256,512,768".
+
+    Returns:
+        A tuple of four positive channel widths.
+
+    Raises:
+        ValueError: If value does not contain exactly four positive integers.
+    """
+    try:
+        channels = tuple(int(part.strip()) for part in value.split(","))
+    except ValueError as exc:
+        raise ValueError("--unet_channels must be comma-separated integers") from exc
+
+    if len(channels) != 4 or any(channel <= 0 for channel in channels):
+        raise ValueError("--unet_channels must contain exactly four positive integers")
+    return channels
+
+
 @torch.no_grad()
 def cache_latents(config: TrainConfig, device: torch.device) -> None:
     """Encodes training images into VAE latent space and saves a cache.
@@ -156,8 +182,19 @@ def cache_latents(config: TrainConfig, device: torch.device) -> None:
     """
     latent_path = Path(config.latent_cache)
     if latent_path.exists() and not config.rebuild_cache:
+        payload = torch.load(latent_path, map_location="cpu")
+        cached_flip_pairs = bool(payload.get("cache_flip_pairs", False))
+        cached_augmented = bool(payload.get("augmented", False))
+        if cached_flip_pairs != config.cache_flip_pairs or cached_augmented != config.augment_cache:
+            raise ValueError(
+                "Existing latent cache was built with different cache options. "
+                "Use --rebuild_cache or choose a different --latent_cache path."
+            )
         print(f"Using existing latent cache: {latent_path}")
         return
+
+    if config.cache_flip_pairs and config.augment_cache:
+        raise ValueError("--cache_flip_pairs and --augment_cache should not be enabled together")
 
     dataset = ImageDataset(Path(config.image_dir), augment=config.augment_cache)
     dataloader = DataLoader(
@@ -179,6 +216,12 @@ def cache_latents(config: TrainConfig, device: torch.device) -> None:
         latent = latent * vae.config.scaling_factor
         latents.append(latent.cpu())
 
+        if config.cache_flip_pairs:
+            flipped_values = torch.flip(pixel_values, dims=[-1])
+            flipped_latent = vae.encode(flipped_values).latent_dist.sample()
+            flipped_latent = flipped_latent * vae.config.scaling_factor
+            latents.append(flipped_latent.cpu())
+
     latent_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -186,6 +229,7 @@ def cache_latents(config: TrainConfig, device: torch.device) -> None:
             "vae": VAE_MODEL_ID,
             "image_dir": str(config.image_dir),
             "augmented": config.augment_cache,
+            "cache_flip_pairs": config.cache_flip_pairs,
         },
         latent_path,
     )
@@ -225,7 +269,7 @@ def save_checkpoint(unet, ema, output_dir: Path, step: int, config: TrainConfig)
     ema_dir = output_dir / f"unet_ema_step_{step:07d}"
     unet.save_pretrained(step_dir)
 
-    ema_unet = build_unet().to(next(unet.parameters()).device)
+    ema_unet = build_unet(parse_unet_channels(config.unet_channels)).to(next(unet.parameters()).device)
     ema_unet.load_state_dict(unet.state_dict())
     ema.copy_to(ema_unet)
     ema_unet.save_pretrained(ema_dir)
@@ -263,7 +307,8 @@ def train(config: TrainConfig) -> None:
         drop_last=True,
     )
 
-    unet = build_unet().to(device)
+    unet_channels = parse_unet_channels(config.unet_channels)
+    unet = build_unet(unet_channels).to(device)
     unet.train()
     ema = EMAModel(unet, decay=config.ema_decay)
     scheduler = build_train_scheduler()
@@ -327,7 +372,7 @@ def train(config: TrainConfig) -> None:
                     break
 
     final_dir = output_dir / "unet_ema_final"
-    final_unet = build_unet().to(device)
+    final_unet = build_unet(parse_unet_channels(config.unet_channels)).to(device)
     final_unet.load_state_dict(unet.state_dict())
     ema.copy_to(final_unet)
     final_unet.save_pretrained(final_dir)
@@ -348,7 +393,9 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--latent_cache", type=str, default=defaults.latent_cache)
     parser.add_argument("--output_dir", type=str, default=defaults.output_dir)
     parser.add_argument("--rebuild_cache", action="store_true", default=defaults.rebuild_cache)
-    parser.add_argument("--augment_cache", action="store_true", default=defaults.augment_cache, help="Cache one horizontally-augmented pass. Usually keep off.")
+    parser.add_argument("--augment_cache", action="store_true", default=defaults.augment_cache, help="Cache one randomly horizontally-augmented pass. Usually keep off.")
+    parser.add_argument("--cache_flip_pairs", action="store_true", default=defaults.cache_flip_pairs, help="Cache both original and horizontally flipped latents for each image.")
+    parser.add_argument("--unet_channels", type=str, default=defaults.unet_channels, help="Comma-separated U-Net channel widths, e.g. 128,256,512,768.")
     parser.add_argument("--epochs", type=int, default=defaults.epochs)
     parser.add_argument("--max_steps", type=int, default=defaults.max_steps)
     parser.add_argument("--batch_size", type=int, default=defaults.batch_size)
