@@ -1,0 +1,6 @@
+{
+  "ema_checkpoint": "HW5/model/baseline_100k/unet_ema_step_0100000",
+  "latent_cache": "HW5/model/cache/latents.pt",
+  "raw_checkpoint": "HW5/model/baseline_100k/unet_step_0100000",
+  "step": 100000
+}

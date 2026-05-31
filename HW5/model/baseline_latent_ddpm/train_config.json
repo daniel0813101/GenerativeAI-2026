@@ -1,0 +1,22 @@
+{
+  "augment_cache": false,
+  "batch_size": 64,
+  "device": "cuda",
+  "ema_decay": 0.9999,
+  "encode_batch_size": 32,
+  "epochs": 350,
+  "grad_accum_steps": 1,
+  "image_dir": "HW5/public_data/images",
+  "latent_cache": "HW5/model/cache/latents.pt",
+  "lr": 0.0001,
+  "max_grad_norm": 1.0,
+  "max_steps": 0,
+  "mixed_precision": true,
+  "num_workers": 4,
+  "output_dir": "HW5/model/baseline_latent_ddpm",
+  "rebuild_cache": false,
+  "save_every": 5000,
+  "seed": 42,
+  "warmup_steps": 500,
+  "weight_decay": 0.0001
+}
