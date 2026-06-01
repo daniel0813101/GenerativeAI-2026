@@ -35,7 +35,9 @@ class TrainConfig:
         rebuild_cache: Whether to overwrite an existing latent cache.
         augment_cache: Whether to randomly horizontally augment one cache pass.
         cache_flip_pairs: Whether to cache both original and horizontally flipped latents.
+        cache_mild_augments: Whether to cache original, color-jittered, and affine latents.
         unet_channels: Comma-separated U-Net channel widths for four resolution stages.
+        init_unet_checkpoint: Optional checkpoint directory used to initialize the U-Net.
         epochs: Number of epochs to train when max_steps is unset.
         max_steps: Explicit optimizer update count. Uses epochs when set to 0.
         batch_size: Latent training batch size.
@@ -59,7 +61,9 @@ class TrainConfig:
     rebuild_cache: bool = False
     augment_cache: bool = False
     cache_flip_pairs: bool = False
+    cache_mild_augments: bool = False
     unet_channels: str = "128,256,512,512"
+    init_unet_checkpoint: str = ""
     epochs: int = 350
     max_steps: int = 0
     batch_size: int = 64
@@ -120,6 +124,77 @@ class ImageDataset(Dataset):
         """
         image = Image.open(self.image_paths[index]).convert("RGB")
         return self.transform(image)
+
+
+class MildAugmentImageDataset(Dataset):
+    """Loads original plus mild augmented image variants for VAE caching."""
+
+    def __init__(self, image_dir: Path, image_size: int = IMAGE_SIZE):
+        """Initializes the mild augmentation image dataset.
+
+        Args:
+            image_dir: Directory containing PNG training images.
+            image_size: Output square image size expected by the VAE.
+
+        Raises:
+            FileNotFoundError: If no PNG images are found in image_dir.
+        """
+        self.image_paths = sorted(p for p in image_dir.glob("*.png") if p.is_file())
+        if not self.image_paths:
+            raise FileNotFoundError(f"No PNG images found under {image_dir}")
+
+        self.original_transform = transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5] * 3, [0.5] * 3),
+            ]
+        )
+        self.color_transform = transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size)),
+                transforms.ColorJitter(brightness=0.08, contrast=0.08, saturation=0.06),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5] * 3, [0.5] * 3),
+            ]
+        )
+        self.affine_transform = transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size)),
+                transforms.RandomAffine(
+                    degrees=2,
+                    translate=(0.02, 0.02),
+                    scale=(0.97, 1.03),
+                    fill=128,
+                ),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5] * 3, [0.5] * 3),
+            ]
+        )
+
+    def __len__(self) -> int:
+        """Returns the number of available training images."""
+        return len(self.image_paths)
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        """Loads one image and returns original plus mild augmented variants.
+
+        Args:
+            index: Image index.
+
+        Returns:
+            A tensor with shape (3, 3, image_size, image_size), where the first
+            dimension indexes original, color-jittered, and affine variants.
+        """
+        image = Image.open(self.image_paths[index]).convert("RGB")
+        return torch.stack(
+            [
+                self.original_transform(image),
+                self.color_transform(image),
+                self.affine_transform(image),
+            ],
+            dim=0,
+        )
 
 
 class LatentDataset(Dataset):
@@ -185,7 +260,12 @@ def cache_latents(config: TrainConfig, device: torch.device) -> None:
         payload = torch.load(latent_path, map_location="cpu")
         cached_flip_pairs = bool(payload.get("cache_flip_pairs", False))
         cached_augmented = bool(payload.get("augmented", False))
-        if cached_flip_pairs != config.cache_flip_pairs or cached_augmented != config.augment_cache:
+        cached_mild_augments = bool(payload.get("cache_mild_augments", False))
+        if (
+            cached_flip_pairs != config.cache_flip_pairs
+            or cached_augmented != config.augment_cache
+            or cached_mild_augments != config.cache_mild_augments
+        ):
             raise ValueError(
                 "Existing latent cache was built with different cache options. "
                 "Use --rebuild_cache or choose a different --latent_cache path."
@@ -193,10 +273,22 @@ def cache_latents(config: TrainConfig, device: torch.device) -> None:
         print(f"Using existing latent cache: {latent_path}")
         return
 
-    if config.cache_flip_pairs and config.augment_cache:
-        raise ValueError("--cache_flip_pairs and --augment_cache should not be enabled together")
+    enabled_cache_modes = sum(
+        [
+            config.augment_cache,
+            config.cache_flip_pairs,
+            config.cache_mild_augments,
+        ]
+    )
+    if enabled_cache_modes > 1:
+        raise ValueError(
+            "Use only one of --augment_cache, --cache_flip_pairs, or --cache_mild_augments"
+        )
 
-    dataset = ImageDataset(Path(config.image_dir), augment=config.augment_cache)
+    if config.cache_mild_augments:
+        dataset = MildAugmentImageDataset(Path(config.image_dir))
+    else:
+        dataset = ImageDataset(Path(config.image_dir), augment=config.augment_cache)
     dataloader = DataLoader(
         dataset,
         batch_size=config.encode_batch_size,
@@ -212,6 +304,10 @@ def cache_latents(config: TrainConfig, device: torch.device) -> None:
     latents = []
     for batch in tqdm(dataloader, desc="Caching VAE latents"):
         pixel_values = batch.to(device, non_blocking=True)
+        if pixel_values.ndim == 5:
+            batch_size, variants, channels, height, width = pixel_values.shape
+            pixel_values = pixel_values.view(batch_size * variants, channels, height, width)
+
         latent = vae.encode(pixel_values).latent_dist.sample()
         latent = latent * vae.config.scaling_factor
         latents.append(latent.cpu())
@@ -230,6 +326,7 @@ def cache_latents(config: TrainConfig, device: torch.device) -> None:
             "image_dir": str(config.image_dir),
             "augmented": config.augment_cache,
             "cache_flip_pairs": config.cache_flip_pairs,
+            "cache_mild_augments": config.cache_mild_augments,
         },
         latent_path,
     )
@@ -282,6 +379,8 @@ def save_checkpoint(unet, ema, output_dir: Path, step: int, config: TrainConfig)
             "raw_checkpoint": str(step_dir),
             "ema_checkpoint": str(ema_dir),
             "latent_cache": config.latent_cache,
+            "unet_channels": config.unet_channels,
+            "init_unet_checkpoint": config.init_unet_checkpoint,
         },
     )
     print(f"Saved checkpoints at step {step}")
@@ -308,7 +407,15 @@ def train(config: TrainConfig) -> None:
     )
 
     unet_channels = parse_unet_channels(config.unet_channels)
-    unet = build_unet(unet_channels).to(device)
+    if config.init_unet_checkpoint:
+        unet = build_unet(unet_channels)
+        loaded_unet = type(unet).from_pretrained(config.init_unet_checkpoint)
+        unet.load_state_dict(loaded_unet.state_dict())
+        del loaded_unet
+        print(f"Initialized U-Net from {config.init_unet_checkpoint}")
+    else:
+        unet = build_unet(unet_channels)
+    unet = unet.to(device)
     unet.train()
     ema = EMAModel(unet, decay=config.ema_decay)
     scheduler = build_train_scheduler()
@@ -395,7 +502,9 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--rebuild_cache", action="store_true", default=defaults.rebuild_cache)
     parser.add_argument("--augment_cache", action="store_true", default=defaults.augment_cache, help="Cache one randomly horizontally-augmented pass. Usually keep off.")
     parser.add_argument("--cache_flip_pairs", action="store_true", default=defaults.cache_flip_pairs, help="Cache both original and horizontally flipped latents for each image.")
+    parser.add_argument("--cache_mild_augments", action="store_true", default=defaults.cache_mild_augments, help="Cache original, mild color-jittered, and mild affine latents for each image.")
     parser.add_argument("--unet_channels", type=str, default=defaults.unet_channels, help="Comma-separated U-Net channel widths, e.g. 128,256,512,768.")
+    parser.add_argument("--init_unet_checkpoint", type=str, default=defaults.init_unet_checkpoint, help="Optional U-Net checkpoint directory to initialize from before training.")
     parser.add_argument("--epochs", type=int, default=defaults.epochs)
     parser.add_argument("--max_steps", type=int, default=defaults.max_steps)
     parser.add_argument("--batch_size", type=int, default=defaults.batch_size)

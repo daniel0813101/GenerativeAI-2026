@@ -46,6 +46,24 @@ python HW5/code/train.py \
   --output_dir HW5/model/unet_large_150k
 ```
 
+Mild augmentation fine-tuning experiment:
+
+```bash
+python HW5/code/train.py \
+  --mixed_precision \
+  --unet_channels 192,384,512,768 \
+  --init_unet_checkpoint HW5/model/unet_large_150k/unet_ema_step_0150000 \
+  --rebuild_cache \
+  --cache_mild_augments \
+  --latent_cache HW5/model/cache/latents_mild_aug.pt \
+  --lr 5e-5 \
+  --max_steps 75000 \
+  --save_every 15000 \
+  --output_dir HW5/model/unet_large_mild_aug_ft
+```
+
+This caches original, mild color-jittered, and mild affine VAE latents for each image, then fine-tunes from the best large U-Net checkpoint.
+
 ## Generate
 
 ```bash
