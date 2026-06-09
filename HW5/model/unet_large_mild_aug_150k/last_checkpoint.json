@@ -1,0 +1,8 @@
+{
+  "ema_checkpoint": "HW5/model/unet_large_mild_aug_150k/unet_ema_step_0150000",
+  "init_unet_checkpoint": "",
+  "latent_cache": "HW5/model/cache/latents_mild_aug.pt",
+  "raw_checkpoint": "HW5/model/unet_large_mild_aug_150k/unet_step_0150000",
+  "step": 150000,
+  "unet_channels": "192,384,512,768"
+}

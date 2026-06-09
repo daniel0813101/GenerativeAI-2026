@@ -64,6 +64,31 @@ python HW5/code/train.py \
 
 This caches original, mild color-jittered, and mild affine VAE latents for each image, then fine-tunes from the best large U-Net checkpoint.
 
+Large U-Net v-prediction experiment:
+
+```bash
+python HW5/code/train.py \
+  --mixed_precision \
+  --unet_channels 192,384,512,768 \
+  --prediction_type v_prediction \
+  --latent_cache HW5/model/cache/latents.pt \
+  --max_steps 150000 \
+  --save_every 15000 \
+  --output_dir HW5/model/unet_large_vpred_150k
+```
+
+When generating from a v-prediction checkpoint, pass the matching prediction type:
+
+```bash
+python HW5/code/inference.py \
+  --checkpoint_dir HW5/model/unet_large_vpred_150k/unet_ema_step_0150000 \
+  --output_dir HW5/scoring_program/input/res \
+  --num_samples 3000 \
+  --sampler ddim \
+  --num_inference_steps 250 \
+  --prediction_type v_prediction
+```
+
 ## Generate
 
 ```bash

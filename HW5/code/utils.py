@@ -61,11 +61,15 @@ def build_unet(block_out_channels: tuple[int, ...] = (128, 256, 512, 512)) -> UN
     )
 
 
-def build_train_scheduler() -> DDPMScheduler:
+def build_train_scheduler(prediction_type: str = "epsilon") -> DDPMScheduler:
     """Builds the DDPM scheduler shared by training and inference samplers.
 
+    Args:
+        prediction_type: Diffusion target type. Use "epsilon" for noise
+            prediction or "v_prediction" for velocity prediction.
+
     Returns:
-        A DDPMScheduler configured to train epsilon prediction on VAE latents.
+        A DDPMScheduler configured for the requested prediction target.
     """
     return DDPMScheduler(
         num_train_timesteps=1000,
@@ -73,7 +77,7 @@ def build_train_scheduler() -> DDPMScheduler:
         beta_end=0.012,
         beta_schedule="scaled_linear",
         clip_sample=False,
-        prediction_type="epsilon",
+        prediction_type=prediction_type,
     )
 
 

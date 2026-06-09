@@ -38,6 +38,7 @@ class TrainConfig:
         cache_mild_augments: Whether to cache original, color-jittered, and affine latents.
         unet_channels: Comma-separated U-Net channel widths for four resolution stages.
         init_unet_checkpoint: Optional checkpoint directory used to initialize the U-Net.
+        prediction_type: Diffusion target type: "epsilon" or "v_prediction".
         epochs: Number of epochs to train when max_steps is unset.
         max_steps: Explicit optimizer update count. Uses epochs when set to 0.
         batch_size: Latent training batch size.
@@ -64,6 +65,7 @@ class TrainConfig:
     cache_mild_augments: bool = False
     unet_channels: str = "128,256,512,512"
     init_unet_checkpoint: str = ""
+    prediction_type: str = "epsilon"
     epochs: int = 350
     max_steps: int = 0
     batch_size: int = 64
@@ -381,6 +383,7 @@ def save_checkpoint(unet, ema, output_dir: Path, step: int, config: TrainConfig)
             "latent_cache": config.latent_cache,
             "unet_channels": config.unet_channels,
             "init_unet_checkpoint": config.init_unet_checkpoint,
+            "prediction_type": config.prediction_type,
         },
     )
     print(f"Saved checkpoints at step {step}")
@@ -418,7 +421,9 @@ def train(config: TrainConfig) -> None:
     unet = unet.to(device)
     unet.train()
     ema = EMAModel(unet, decay=config.ema_decay)
-    scheduler = build_train_scheduler()
+    if config.prediction_type not in {"epsilon", "v_prediction"}:
+        raise ValueError('--prediction_type must be "epsilon" or "v_prediction"')
+    scheduler = build_train_scheduler(config.prediction_type)
     optimizer = AdamW(unet.parameters(), lr=config.lr, betas=(0.9, 0.999), weight_decay=config.weight_decay)
 
     updates_per_epoch = math.ceil(len(dataloader) / config.grad_accum_steps)
@@ -450,9 +455,14 @@ def train(config: TrainConfig) -> None:
             )
             noisy_latents = scheduler.add_noise(latents, noise, timesteps)
 
+            if config.prediction_type == "epsilon":
+                target = noise
+            else:
+                target = scheduler.get_velocity(latents, noise, timesteps)
+
             with torch.cuda.amp.autocast(enabled=config.mixed_precision and device.type == "cuda"):
                 pred = unet(noisy_latents, timesteps).sample
-                loss = F.mse_loss(pred.float(), noise.float()) / config.grad_accum_steps
+                loss = F.mse_loss(pred.float(), target.float()) / config.grad_accum_steps
 
             scaler.scale(loss).backward()
             accum_step += 1
@@ -505,6 +515,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--cache_mild_augments", action="store_true", default=defaults.cache_mild_augments, help="Cache original, mild color-jittered, and mild affine latents for each image.")
     parser.add_argument("--unet_channels", type=str, default=defaults.unet_channels, help="Comma-separated U-Net channel widths, e.g. 128,256,512,768.")
     parser.add_argument("--init_unet_checkpoint", type=str, default=defaults.init_unet_checkpoint, help="Optional U-Net checkpoint directory to initialize from before training.")
+    parser.add_argument("--prediction_type", choices=["epsilon", "v_prediction"], default=defaults.prediction_type, help="Diffusion prediction target used for training and sampling.")
     parser.add_argument("--epochs", type=int, default=defaults.epochs)
     parser.add_argument("--max_steps", type=int, default=defaults.max_steps)
     parser.add_argument("--batch_size", type=int, default=defaults.batch_size)

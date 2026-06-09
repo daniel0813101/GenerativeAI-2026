@@ -21,6 +21,7 @@ class InferenceConfig:
         batch_size: Number of latent samples generated per batch.
         sampler: Reverse diffusion sampler name: "ddpm", "ddim", or "dpm".
         num_inference_steps: Number of denoising steps used by the sampler.
+        prediction_type: Diffusion prediction type used by the trained checkpoint.
         seed: Random seed for reproducible sampling.
         clean_output: Whether to delete existing PNG files in output_dir first.
         device: Torch device string, usually "cuda" or "cpu".
@@ -32,17 +33,19 @@ class InferenceConfig:
     batch_size: int = 32
     sampler: str = "ddim"
     num_inference_steps: int = 250
+    prediction_type: str = "epsilon"
     seed: int = 1234
     clean_output: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def build_sampler(name: str, num_steps: int):
+def build_sampler(name: str, num_steps: int, prediction_type: str):
     """Creates a scheduler for reverse diffusion sampling.
 
     Args:
         name: Sampler type. Must be "ddpm", "ddim", or "dpm".
         num_steps: Number of inference timesteps to run.
+        prediction_type: Prediction type used during training.
 
     Returns:
         A configured diffusers scheduler with timesteps initialized.
@@ -50,7 +53,7 @@ def build_sampler(name: str, num_steps: int):
     Raises:
         ValueError: If name does not match a supported sampler.
     """
-    base = build_train_scheduler()
+    base = build_train_scheduler(prediction_type)
     if name == "ddpm":
         scheduler = DDPMScheduler.from_config(base.config)
     elif name == "ddim":
@@ -86,7 +89,7 @@ def generate(config: InferenceConfig) -> None:
     unet.requires_grad_(False)
     unet.eval()
 
-    scheduler = build_sampler(config.sampler, config.num_inference_steps)
+    scheduler = build_sampler(config.sampler, config.num_inference_steps, config.prediction_type)
     to_pil = transforms.ToPILImage()
     generator = torch.Generator(device=device).manual_seed(config.seed)
 
@@ -133,6 +136,7 @@ def parse_args() -> InferenceConfig:
     parser.add_argument("--batch_size", type=int, default=defaults.batch_size)
     parser.add_argument("--sampler", choices=["ddpm", "ddim", "dpm"], default=defaults.sampler)
     parser.add_argument("--num_inference_steps", type=int, default=defaults.num_inference_steps)
+    parser.add_argument("--prediction_type", choices=["epsilon", "v_prediction"], default=defaults.prediction_type, help="Prediction type used by the trained checkpoint.")
     parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--clean_output", action=argparse.BooleanOptionalAction, default=defaults.clean_output)
     parser.add_argument("--device", type=str, default=defaults.device)
