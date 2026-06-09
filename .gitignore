@@ -239,6 +239,8 @@ Temporary Items
 # Datasets
 *.csv
 dataset/
+public_data/
+res/
 
 # Cache
 paper_cache/
