@@ -1,0 +1,9 @@
+torch>=2.3
+torchvision>=0.18
+numpy>=1.26
+pillow>=10.0
+tqdm>=4.66
+scipy>=1.11
+ftfy>=6.2
+regex>=2024.5.15
+open_clip_torch>=2.24

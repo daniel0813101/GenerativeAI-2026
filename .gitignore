@@ -238,6 +238,16 @@ Temporary Items
 
 # Datasets
 *.csv
+
+# HW6 local data, generated images, and scorer artifacts
+HW6/scoring_program/*
+HW6/data/trainset/
+HW6/data/train/
+HW6/data/external/
+HW6/generated_images/
+HW6/submission/
+HW6/checkpoints/
+HW6/*.zip
 dataset/
 public_data/
 res/
